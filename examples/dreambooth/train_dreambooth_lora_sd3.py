@@ -856,6 +856,19 @@ class DreamBoothDataset(Dataset):
             if not data_root.exists():
                 raise ValueError("data_root does not exist.")
 
+            mask_dir_cache = {}
+
+            def get_mask_path(mask_dir, stem):
+                if mask_dir not in mask_dir_cache:
+                    stem_map = {}
+                    with os.scandir(mask_dir) as it:
+                        for entry in it:
+                            if entry.is_file():
+                                entry_path = Path(entry.path)
+                                stem_map.setdefault(entry_path.stem, entry_path)
+                    mask_dir_cache[mask_dir] = stem_map
+                return mask_dir_cache[mask_dir].get(stem)
+
             instance_images = []
             instance_masks = []
             with train_data_txt.open("r", encoding="utf-8") as handle:
@@ -863,20 +876,19 @@ class DreamBoothDataset(Dataset):
                     line = line.strip()
                     if not line:
                         continue
-                    line = line.replace("\\", "/")
                     image_path = data_root / line
                     if not image_path.exists():
                         raise ValueError(f"Instance image not found: {image_path}")
                     if "images" not in image_path.parts:
                         raise ValueError(f"Expected 'images' in path: {image_path}")
                     mask_parts = list(image_path.parts)
-                    mask_parts[mask_parts.index("images")] = "masks"
+                    mask_parts[mask_parts.index("images")] = "mask"
                     mask_dir = Path(*mask_parts[:-1])
-                    mask_candidates = sorted(mask_dir.glob(f"{image_path.stem}.*"))
-                    if not mask_candidates:
+                    mask_path = get_mask_path(mask_dir, image_path.stem)
+                    if mask_path is None:
                         raise ValueError(f"Mask not found for image {image_path}")
-                    instance_images.append(Image.open(image_path))
-                    instance_masks.append(Image.open(mask_candidates[0]))
+                    instance_images.append(image_path)
+                    instance_masks.append(mask_path)
             self.custom_instance_prompts = None
         else:
             self.instance_data_root = Path(instance_data_root)
@@ -889,59 +901,36 @@ class DreamBoothDataset(Dataset):
                 raise ValueError("Mask images root doesn't exists.")
 
             image_paths = sorted([path for path in Path(instance_data_root).iterdir() if path.is_file()])
-            mask_paths = {path.name: path for path in self.mask_data_root.iterdir() if path.is_file()}
+            mask_paths = {}
+            with os.scandir(self.mask_data_root) as it:
+                for entry in it:
+                    if entry.is_file():
+                        entry_path = Path(entry.path)
+                        mask_paths.setdefault(entry_path.stem, entry_path)
             instance_images = []
             instance_masks = []
             for image_path in image_paths:
-                if image_path.name not in mask_paths:
+                mask_path = mask_paths.get(image_path.stem)
+                if mask_path is None:
                     raise ValueError(f"Mask not found for image {image_path.name}.")
-                instance_images.append(Image.open(image_path))
-                instance_masks.append(Image.open(mask_paths[image_path.name]))
+                instance_images.append(image_path)
+                instance_masks.append(mask_path)
             self.custom_instance_prompts = None
 
         self.instance_pairs = []
         for img, mask in zip(instance_images, instance_masks):
             self.instance_pairs.extend(itertools.repeat((img, mask), repeats))
 
-        self.pixel_values = []
-        self.mask_values = []
-        train_resize = transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR)
-        mask_resize = transforms.Resize(size, interpolation=transforms.InterpolationMode.NEAREST)
-        train_crop = transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size)
-        train_flip = transforms.RandomHorizontalFlip(p=1.0)
-        train_transforms = transforms.Compose(
+        self.train_resize = transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR)
+        self.mask_resize = transforms.Resize(size, interpolation=transforms.InterpolationMode.NEAREST)
+        self.train_crop = transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size)
+        self.train_flip = transforms.RandomHorizontalFlip(p=1.0)
+        self.train_transforms = transforms.Compose(
             [
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ]
         )
-        for image, mask in self.instance_pairs:
-            image = exif_transpose(image)
-            if not image.mode == "RGB":
-                image = image.convert("RGB")
-            mask = exif_transpose(mask)
-            if not mask.mode == "L":
-                mask = mask.convert("L")
-            image = train_resize(image)
-            mask = mask_resize(mask)
-            if args.random_flip and random.random() < 0.5:
-                # flip
-                image = train_flip(image)
-                mask = train_flip(mask)
-            if args.center_crop:
-                y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
-                x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
-                image = train_crop(image)
-                mask = train_crop(mask)
-            else:
-                y1, x1, h, w = train_crop.get_params(image, (args.resolution, args.resolution))
-                image = crop(image, y1, x1, h, w)
-                mask = crop(mask, y1, x1, h, w)
-            image = train_transforms(image)
-            mask = transforms.ToTensor()(mask)
-            mask = (mask > 0.5).float()
-            self.pixel_values.append(image)
-            self.mask_values.append(mask)
 
         self.num_instance_images = len(self.instance_pairs)
         self._length = self.num_instance_images
@@ -970,10 +959,38 @@ class DreamBoothDataset(Dataset):
     def __len__(self):
         return self._length
 
+    def _load_image(self, item, mode):
+        if isinstance(item, (str, Path)):
+            with Image.open(item) as image:
+                image = image.copy()
+        else:
+            image = item
+        image = exif_transpose(image)
+        if image.mode != mode:
+            image = image.convert(mode)
+        return image
+
     def __getitem__(self, index):
         example = {}
-        instance_image = self.pixel_values[index % self.num_instance_images]
-        instance_mask = self.mask_values[index % self.num_instance_images]
+        instance_image, instance_mask = self.instance_pairs[index % self.num_instance_images]
+        instance_image = self._load_image(instance_image, "RGB")
+        instance_mask = self._load_image(instance_mask, "L")
+
+        instance_image = self.train_resize(instance_image)
+        instance_mask = self.mask_resize(instance_mask)
+        if args.random_flip and random.random() < 0.5:
+            instance_image = self.train_flip(instance_image)
+            instance_mask = self.train_flip(instance_mask)
+        if args.center_crop:
+            instance_image = self.train_crop(instance_image)
+            instance_mask = self.train_crop(instance_mask)
+        else:
+            y1, x1, h, w = self.train_crop.get_params(instance_image, (args.resolution, args.resolution))
+            instance_image = crop(instance_image, y1, x1, h, w)
+            instance_mask = crop(instance_mask, y1, x1, h, w)
+        instance_image = self.train_transforms(instance_image)
+        instance_mask = transforms.ToTensor()(instance_mask)
+        instance_mask = (instance_mask > 0.5).float()
         example["instance_images"] = instance_image
         example["instance_masks"] = instance_mask
 
@@ -988,11 +1005,11 @@ class DreamBoothDataset(Dataset):
             example["instance_prompt"] = self.instance_prompt
 
         if self.class_data_root:
-            class_image = Image.open(self.class_images_path[index % self.num_class_images])
-            class_image = exif_transpose(class_image)
-
-            if not class_image.mode == "RGB":
-                class_image = class_image.convert("RGB")
+            with Image.open(self.class_images_path[index % self.num_class_images]) as class_image:
+                class_image = exif_transpose(class_image)
+                if not class_image.mode == "RGB":
+                    class_image = class_image.convert("RGB")
+                class_image = class_image.copy()
             example["class_images"] = self.image_transforms(class_image)
             example["class_prompt"] = self.class_prompt
 

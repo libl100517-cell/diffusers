@@ -863,13 +863,14 @@ class DreamBoothDataset(Dataset):
                     line = line.strip()
                     if not line:
                         continue
+                    line = line.replace("\\", "/")
                     image_path = data_root / line
                     if not image_path.exists():
                         raise ValueError(f"Instance image not found: {image_path}")
                     if "images" not in image_path.parts:
                         raise ValueError(f"Expected 'images' in path: {image_path}")
                     mask_parts = list(image_path.parts)
-                    mask_parts[mask_parts.index("images")] = "mask"
+                    mask_parts[mask_parts.index("images")] = "masks"
                     mask_dir = Path(*mask_parts[:-1])
                     mask_candidates = sorted(mask_dir.glob(f"{image_path.stem}.*"))
                     if not mask_candidates:

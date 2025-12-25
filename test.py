@@ -19,25 +19,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--base",
         type=str,
-        required=True,
+        default="/home/libaoluo/sam2/diffusers-main/models/stable-diffusion-3-medium/" ,
         help="Path to the diffusers SD3 base model directory.",
     )
     parser.add_argument(
         "--lora_dir",
         type=str,
-        required=True,
+        default="/home/libaoluo/sam2/diffusers-main/examples/dreambooth/sd3-dreambooth/checkpoint-18000/",
         help="Directory containing LoRA weights and mask_encoder.bin.",
     )
     parser.add_argument(
         "--background",
         type=str,
-        required=True,
+        default="/home/libaoluo/dataset/opensourse_datasets/BCL11k/images/c1.jpg",
         help="Path to background image.",
     )
     parser.add_argument(
         "--mask",
         type=str,
-        required=True,
+        default="/home/libaoluo/dataset/opensourse_datasets/BCL11k/masks/c1.png",
         help="Path to mask image (white=inpaint region).",
     )
     parser.add_argument("--output", type=str, default="out_sd3_maskcond.png")

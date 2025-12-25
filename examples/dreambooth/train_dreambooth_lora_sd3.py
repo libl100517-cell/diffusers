@@ -450,10 +450,10 @@ def parse_args(input_args=None):
     )
 
     parser.add_argument(
-        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=32, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
-        "--sample_batch_size", type=int, default=16, help="Batch size (per device) for sampling images."
+        "--sample_batch_size", type=int, default=32, help="Batch size (per device) for sampling images."
     )
     parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
@@ -1216,7 +1216,7 @@ def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
-    kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -1959,8 +1959,8 @@ def main(args):
                 # zt = (1 - texp) * x + texp * z1
                 sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
                 if args.masked_noise_training:
-                    x1 = model_input
-                    x0 = (1 - mask_latents) * model_input + mask_latents * noise
+                    x0 = model_input
+                    x1 = (1 - mask_latents) * model_input + mask_latents * noise
                     noisy_model_input = (1.0 - sigmas) * x0 + sigmas * x1
                 else:
                     noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
@@ -1988,10 +1988,13 @@ def main(args):
 
                 # flow matching loss
                 if args.masked_noise_training:
-                    target = x1 - x0
+                    if args.precondition_outputs:
+                        target = x0                # 关键：监督 x0
+                    else:
+                        target = x1 - x0           # 监督 velocity
                 else:
                     if args.precondition_outputs:
-                        target = model_input
+                        target = model_input       # 原版就是这样
                     else:
                         target = noise - model_input
 

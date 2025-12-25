@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lora_dir",
         type=str,
-        default="/home/libaoluo/sam2/diffusers-main/examples/dreambooth/sd3-crack/checkpoint-500/",
+        default="/home/libaoluo/sam2/diffusers-main/examples/dreambooth/sd3-crack/checkpoint-1000/",
         help="Directory containing LoRA weights and mask_encoder.bin.",
     )
     parser.add_argument(

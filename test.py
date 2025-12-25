@@ -240,9 +240,9 @@ def main() -> None:
 
         latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
-    x = x.to(torch.float32)
-    x = x / vae.config.scaling_factor + vae.config.shift_factor
-    out = vae.decode(x).sample
+    latents = latents.to(torch.float32)
+    latents = latents / vae.config.scaling_factor + vae.config.shift_factor
+    out = vae.decode(latents).sample
     out = (out / 2 + 0.5).clamp(0, 1)
     out = (out[0].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)

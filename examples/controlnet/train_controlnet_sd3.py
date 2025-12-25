@@ -36,7 +36,7 @@ import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
-from datasets import load_dataset
+from datasets import Dataset, DatasetDict, load_dataset
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from PIL import Image
@@ -312,6 +312,14 @@ def parse_args(input_args=None):
         help="Number of extra conditioning channels for controlnet.",
     )
     parser.add_argument(
+        "--use_inpainting_conditioning",
+        action="store_true",
+        help=(
+            "Use inpainting-style conditioning by concatenating the masked image with a single-channel mask for"
+            " ControlNet."
+        ),
+    )
+    parser.add_argument(
         "--revision",
         type=str,
         default=None,
@@ -552,6 +560,46 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
+        "--train_data_list",
+        type=str,
+        default=None,
+        help=(
+            "Path to a text file containing relative image paths for training. Each line should be a path relative to"
+            " `--train_data_root`. The corresponding mask path is inferred by replacing the image folder name with"
+            " the mask folder name."
+        ),
+    )
+    parser.add_argument(
+        "--train_data_root",
+        type=str,
+        default=None,
+        help="Root directory that `--train_data_list` paths are relative to.",
+    )
+    parser.add_argument(
+        "--image_folder_name",
+        type=str,
+        default="images",
+        help="Folder name to replace when deriving mask paths from image paths.",
+    )
+    parser.add_argument(
+        "--mask_folder_name",
+        type=str,
+        default="masks",
+        help="Folder name to use when deriving mask paths from image paths.",
+    )
+    parser.add_argument(
+        "--mask_threshold",
+        type=int,
+        default=0,
+        help="Threshold (0-255) for converting masks to binary when applying masked noise.",
+    )
+    parser.add_argument(
+        "--default_prompt",
+        type=str,
+        default="",
+        help="Default prompt to use when loading images from `--train_data_list`.",
+    )
+    parser.add_argument(
         "--image_column", type=str, default="image", help="The column of the dataset containing the target image."
     )
     parser.add_argument(
@@ -644,11 +692,21 @@ def parse_args(input_args=None):
     else:
         args = parser.parse_args()
 
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("Specify either `--dataset_name` or `--train_data_dir`")
+    if args.dataset_name is None and args.train_data_dir is None and args.train_data_list is None:
+        raise ValueError("Specify one of `--dataset_name`, `--train_data_dir`, or `--train_data_list`")
 
-    if args.dataset_name is not None and args.train_data_dir is not None:
-        raise ValueError("Specify only one of `--dataset_name` or `--train_data_dir`")
+    if sum(value is not None for value in (args.dataset_name, args.train_data_dir, args.train_data_list)) > 1:
+        raise ValueError("Specify only one of `--dataset_name`, `--train_data_dir`, or `--train_data_list`")
+
+    if args.train_data_list is not None and args.train_data_root is None:
+        raise ValueError("`--train_data_root` must be set when using `--train_data_list`")
+
+    if (
+        args.use_inpainting_conditioning
+        and args.controlnet_model_name_or_path is None
+        and args.num_extra_conditioning_channels != 1
+    ):
+        raise ValueError("`--num_extra_conditioning_channels` must be 1 when using inpainting conditioning.")
 
     if args.proportion_empty_prompts < 0 or args.proportion_empty_prompts > 1:
         raise ValueError("`--proportion_empty_prompts` must be in the range [0, 1].")
@@ -699,6 +757,34 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
                 cache_dir=args.cache_dir,
                 trust_remote_code=True,
             )
+        else:
+            with open(args.train_data_list, "r", encoding="utf-8") as handle:
+                rel_paths = [line.strip() for line in handle if line.strip()]
+
+            def replace_path_part(path_value, source_name, target_name):
+                normalized_value = path_value.replace("\\", "/")
+                parts = list(Path(normalized_value).parts)
+                if source_name in parts:
+                    source_index = parts.index(source_name)
+                    parts[source_index] = target_name
+                    return str(Path(*parts))
+                raise ValueError(
+                    f"Expected '{source_name}' to be a path component in '{path_value}' for mask derivation."
+                )
+
+            image_paths = [str(Path(args.train_data_root) / rel_path) for rel_path in rel_paths]
+            mask_rel_paths = [
+                replace_path_part(rel_path, args.image_folder_name, args.mask_folder_name) for rel_path in rel_paths
+            ]
+            mask_paths = [str(Path(args.train_data_root) / rel_path) for rel_path in mask_rel_paths]
+            dataset = Dataset.from_dict(
+                {
+                    "image_path": image_paths,
+                    "mask_path": mask_paths,
+                    "text": [args.default_prompt] * len(image_paths),
+                }
+            )
+            dataset = DatasetDict({"train": dataset})
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
 
@@ -707,35 +793,40 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
     column_names = dataset["train"].column_names
 
     # 6. Get the column names for input/target.
-    if args.image_column is None:
-        image_column = column_names[0]
-        logger.info(f"image column defaulting to {image_column}")
+    if args.train_data_list is not None:
+        image_column = "image_path"
+        caption_column = "text"
+        conditioning_image_column = "mask_path"
     else:
-        image_column = args.image_column
-        if image_column not in column_names:
-            raise ValueError(
-                f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
+        if args.image_column is None:
+            image_column = column_names[0]
+            logger.info(f"image column defaulting to {image_column}")
+        else:
+            image_column = args.image_column
+            if image_column not in column_names:
+                raise ValueError(
+                    f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+                )
 
-    if args.caption_column is None:
-        caption_column = column_names[1]
-        logger.info(f"caption column defaulting to {caption_column}")
-    else:
-        caption_column = args.caption_column
-        if caption_column not in column_names:
-            raise ValueError(
-                f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
+        if args.caption_column is None:
+            caption_column = column_names[1]
+            logger.info(f"caption column defaulting to {caption_column}")
+        else:
+            caption_column = args.caption_column
+            if caption_column not in column_names:
+                raise ValueError(
+                    f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+                )
 
-    if args.conditioning_image_column is None:
-        conditioning_image_column = column_names[2]
-        logger.info(f"conditioning image column defaulting to {conditioning_image_column}")
-    else:
-        conditioning_image_column = args.conditioning_image_column
-        if conditioning_image_column not in column_names:
-            raise ValueError(
-                f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
+        if args.conditioning_image_column is None:
+            conditioning_image_column = column_names[2]
+            logger.info(f"conditioning image column defaulting to {conditioning_image_column}")
+        else:
+            conditioning_image_column = args.conditioning_image_column
+            if conditioning_image_column not in column_names:
+                raise ValueError(
+                    f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+                )
 
     def process_captions(examples, is_train=True):
         captions = []
@@ -769,16 +860,79 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
             transforms.ToTensor(),
         ]
     )
+    mask_transforms = transforms.Compose(
+        [
+            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.NEAREST),
+            transforms.CenterCrop(args.resolution),
+            transforms.ToTensor(),
+        ]
+    )
+
+    def load_image(value):
+        if isinstance(value, str):
+            return Image.open(value)
+        return value
+
+    def generate_low_frequency_noise(height, width):
+        downsample = 8
+        noise_height = max(1, height // downsample)
+        noise_width = max(1, width // downsample)
+        noise = np.random.rand(noise_height, noise_width, 3).astype(np.float32)
+        noise_image = Image.fromarray((noise * 255).astype(np.uint8))
+        noise_image = noise_image.resize((width, height), resample=Image.BILINEAR)
+        return np.array(noise_image).astype(np.float32)
+
+    def apply_masked_noise(image, mask):
+        if mask.mode != "L":
+            mask = mask.convert("L")
+        if mask.size != image.size:
+            mask = mask.resize(image.size, resample=Image.NEAREST)
+        image_array = np.array(image.convert("RGB")).astype(np.float32)
+        mask_array = np.array(mask) > args.mask_threshold
+
+        noise_array = generate_low_frequency_noise(*image_array.shape[:2])
+        if mask_array.any():
+            background_pixels = image_array[~mask_array]
+            if background_pixels.size == 0:
+                background_mean = image_array.mean(axis=(0, 1))
+            else:
+                background_mean = background_pixels.reshape(-1, 3).mean(axis=0)
+
+            noise_pixels = noise_array[mask_array]
+            if noise_pixels.size == 0:
+                noise_mean = noise_array.reshape(-1, 3).mean(axis=0)
+            else:
+                noise_mean = noise_pixels.reshape(-1, 3).mean(axis=0)
+
+            noise_array = noise_array - noise_mean + background_mean
+            noise_array = np.clip(noise_array, 0, 255)
+
+            image_array[mask_array] = noise_array[mask_array]
+
+        return Image.fromarray(image_array.astype(np.uint8))
 
     def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        images = [image_transforms(image) for image in images]
+        raw_images = [load_image(image).convert("RGB") for image in examples[image_column]]
+        images = [image_transforms(image) for image in raw_images]
 
-        conditioning_images = [image.convert("RGB") for image in examples[conditioning_image_column]]
-        conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
+        masks = [load_image(image) for image in examples[conditioning_image_column]]
+        if args.use_inpainting_conditioning:
+            masked_images = [apply_masked_noise(image, mask) for image, mask in zip(raw_images, masks)]
+            conditioning_images = [conditioning_image_transforms(image) for image in masked_images]
+            mask_tensors = [mask_transforms(mask.convert("L")) for mask in masks]
+            conditioning_pixel_values = [
+                torch.cat([conditioning_image, mask_tensor], dim=0)
+                for conditioning_image, mask_tensor in zip(conditioning_images, mask_tensors)
+            ]
+        else:
+            if args.train_data_list is not None:
+                conditioning_images = [apply_masked_noise(image, mask) for image, mask in zip(raw_images, masks)]
+            else:
+                conditioning_images = [mask.convert("RGB") for mask in masks]
+            conditioning_pixel_values = [conditioning_image_transforms(image) for image in conditioning_images]
 
         examples["pixel_values"] = images
-        examples["conditioning_pixel_values"] = conditioning_images
+        examples["conditioning_pixel_values"] = conditioning_pixel_values
         examples["prompts"] = process_captions(examples)
 
         return examples
@@ -1040,6 +1194,11 @@ def main(args):
         logger.info("Initializing controlnet weights from transformer")
         controlnet = SD3ControlNetModel.from_transformer(
             transformer, num_extra_conditioning_channels=args.num_extra_conditioning_channels
+        )
+
+    if args.use_inpainting_conditioning and controlnet.config.extra_conditioning_channels != 1:
+        raise ValueError(
+            "Inpainting conditioning requires `extra_conditioning_channels=1` in the ControlNet config."
         )
 
     transformer.requires_grad_(False)

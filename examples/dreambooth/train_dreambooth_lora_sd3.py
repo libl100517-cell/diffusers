@@ -723,6 +723,11 @@ def parse_args(input_args=None):
         default=0.0,
         help="Weight for suppressing predictions outside the mask. Set to > 0 to enable.",
     )
+    parser.add_argument(
+        "--masked_noise_training",
+        action="store_true",
+        help="Use masked noise interpolation for flow matching targets.",
+    )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
 
     if input_args is not None:
@@ -1953,7 +1958,12 @@ def main(args):
                 # Add noise according to flow matching.
                 # zt = (1 - texp) * x + texp * z1
                 sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
-                noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
+                if args.masked_noise_training:
+                    x1 = model_input
+                    x0 = (1 - mask_latents) * model_input + mask_latents * noise
+                    noisy_model_input = (1.0 - sigmas) * x0 + sigmas * x1
+                else:
+                    noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
                 if args.mask_conditioning_scale != 0:
                     mask_features = mask_encoder(mask_latents)
                     noisy_model_input = noisy_model_input + args.mask_conditioning_scale * mask_features
@@ -1977,10 +1987,13 @@ def main(args):
                 weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
 
                 # flow matching loss
-                if args.precondition_outputs:
-                    target = model_input
+                if args.masked_noise_training:
+                    target = x1 - x0
                 else:
-                    target = noise - model_input
+                    if args.precondition_outputs:
+                        target = model_input
+                    else:
+                        target = noise - model_input
 
                 if args.with_prior_preservation:
                     # Chunk the noise and model_pred into two parts and compute the loss on each part separately.

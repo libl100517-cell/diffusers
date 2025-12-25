@@ -190,7 +190,8 @@ def main() -> None:
 
     batch_size = latents.shape[0]
     noise = torch.randn(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
-    x0 = (1 - m.to(latents.dtype)) * latents + m.to(latents.dtype) * noise
+    m_latent = F.interpolate(m, size=latents.shape[-2:], mode="nearest").to(latents.dtype)
+    x0 = (1 - m_latent) * latents + m_latent * noise
     x1 = latents
     x = noise.clone()
 

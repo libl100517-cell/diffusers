@@ -59,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask_condition_scale", type=float, default=1.0)
     parser.add_argument("--precondition_outputs", action="store_true")
     parser.add_argument("--invert_mask", action="store_true")
+    parser.add_argument("--grid_output", type=str, default="out_sd3_maskcond_grid.png")
     return parser.parse_args()
 
 
@@ -158,14 +159,18 @@ def main() -> None:
 
     image = image.resize((args.resolution, args.resolution), resample=Image.BICUBIC)
     mask = mask.resize((args.resolution, args.resolution), resample=Image.NEAREST)
-    mask = mask.point(lambda p: 255 if p > 127 else 0)
+    mask = mask.point(lambda p: 255 if p > 0 else 0)
 
     img = torch.from_numpy(np.array(image)).permute(2, 0, 1).float() / 255.0
     img = img * 2.0 - 1.0
     img = img.unsqueeze(0).to(device=device, dtype=torch.float32)
 
-    m = torch.from_numpy(np.array(mask)).float() / 255.0
-    m = (m > 0.5).unsqueeze(0).unsqueeze(0).to(device=device, dtype=dtype)
+    m = torch.from_numpy(np.array(mask)).float()
+    if m.max() <= 1.0:
+        m = m.clamp(0, 1)
+    else:
+        m = (m > 127).float()
+    m = m.unsqueeze(0).unsqueeze(0).to(device=device, dtype=dtype)
 
     prompt_embeds, pooled = encode_prompt(
         tokenizer1, tokenizer2, tokenizer3, te1, te2, te3, args.prompt, device, dtype
@@ -227,6 +232,24 @@ def main() -> None:
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     Image.fromarray(out).save(args.output)
     print("Saved:", args.output)
+
+    mask_vis = np.array(mask.convert("L"))
+    overlay = image.copy()
+    overlay_arr = np.array(overlay).astype("float32")
+    mask_color = np.zeros_like(overlay_arr)
+    mask_color[..., 0] = 255
+    mask_alpha = (mask_vis.astype("float32") / 255.0) * 0.5
+    overlay_arr = overlay_arr * (1 - mask_alpha[..., None]) + mask_color * mask_alpha[..., None]
+    overlay = Image.fromarray(overlay_arr.astype("uint8"))
+
+    grid = Image.new("RGB", (args.resolution * 2, args.resolution * 2))
+    grid.paste(image, (0, 0))
+    grid.paste(mask.convert("RGB"), (args.resolution, 0))
+    grid.paste(overlay, (0, args.resolution))
+    grid.paste(Image.fromarray(out), (args.resolution, args.resolution))
+    os.makedirs(os.path.dirname(args.grid_output) or ".", exist_ok=True)
+    grid.save(args.grid_output)
+    print("Saved grid:", args.grid_output)
 
 
 if __name__ == "__main__":

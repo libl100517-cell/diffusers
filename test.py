@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lora_dir",
         type=str,
-        default="/home/libaoluo/sam2/diffusers-main/examples/dreambooth/sd3-dreambooth/checkpoint-18000/",
+        default="/home/libaoluo/sam2/diffusers-main/examples/dreambooth/sd3-crack/checkpoint-500/",
         help="Directory containing LoRA weights and mask_encoder.bin.",
     )
     parser.add_argument(
@@ -56,8 +56,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cfg", type=float, default=5.0)
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["fp16", "bf16", "fp32"])
-    parser.add_argument("--mask_condition_scale", type=float, default=1.0)
-    parser.add_argument("--precondition_outputs", action="store_true")
+    parser.add_argument("--mask_condition_scale", type=float, default=0)
+    parser.add_argument("--precondition_outputs", type=int, default=1)
     parser.add_argument("--invert_mask", action="store_true")
     parser.add_argument("--grid_output", type=str, default="out_sd3_maskcond_grid.png")
     return parser.parse_args()
@@ -192,25 +192,22 @@ def main() -> None:
     m_latent = F.interpolate(m, size=latents.shape[-2:], mode="nearest").to(latents.dtype)
     x_bg = latents
     noise0 = torch.randn(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
-    x0 = (1 - m_latent) * x_bg + m_latent * noise0
-    x1_hat = x0.clone()
+    latents = (1 - m_latent) * x_bg + m_latent * noise0   # 初始化 x0 
 
     feat = mask_encoder(m_latent) if args.mask_condition_scale != 0 else None
 
     for i, t in enumerate(timesteps):
-        sigma = sigmas_all[i].view(1, 1, 1, 1)
-        xt = (1.0 - sigma) * x0 + sigma * x1_hat
-
+        latent_in = latents
         if feat is not None:
-            xt = xt + args.mask_condition_scale * feat
+            latent_in = latent_in + args.mask_condition_scale * feat
 
         if args.cfg != 1.0:
-            xt_in = torch.cat([xt, xt], dim=0)
+            xt_in = torch.cat([latent_in, latent_in], dim=0)
             t_in = torch.cat([t.expand(batch_size), t.expand(batch_size)], dim=0)
             enc = torch.cat([negative_embeds, prompt_embeds], dim=0)
             pool = torch.cat([negative_pooled, pooled], dim=0)
         else:
-            xt_in = xt
+            xt_in = latent_in
             t_in = t.expand(batch_size)
             enc = prompt_embeds
             pool = pooled
@@ -223,19 +220,11 @@ def main() -> None:
             return_dict=False,
         )[0]
 
-        if args.precondition_outputs:
-            pred = pred * (-sigma) + xt_in
-
         if args.cfg != 1.0:
-            pred_uncond, pred_text = pred.chunk(2, dim=0)
-            pred_cfg = pred_uncond + args.cfg * (pred_text - pred_uncond)
-        else:
-            pred_cfg = pred
+            pred_u, pred_c = pred.chunk(2, dim=0)
+            pred = pred_u + args.cfg * (pred_c - pred_u)
 
-        x1_hat = x0 + pred_cfg
-        x1_hat = (1 - m_latent) * x_bg + m_latent * x1_hat
-
-    latents = x1_hat
+        latents = scheduler.step(pred, t, latents, return_dict=False)[0]
 
     latents = latents.to(torch.float32)
     latents = latents / vae.config.scaling_factor + vae.config.shift_factor

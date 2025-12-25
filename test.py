@@ -1,0 +1,233 @@
+import argparse
+import os
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler, SD3Transformer2DModel
+from diffusers.utils import logging as dlogging
+from PIL import Image, ImageOps
+from transformers import CLIPTextModelWithProjection, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+
+
+dlogging.set_verbosity_error()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="SD3 mask-conditioned inpaint inference.")
+    parser.add_argument(
+        "--base",
+        type=str,
+        required=True,
+        help="Path to the diffusers SD3 base model directory.",
+    )
+    parser.add_argument(
+        "--lora_dir",
+        type=str,
+        required=True,
+        help="Directory containing LoRA weights and mask_encoder.bin.",
+    )
+    parser.add_argument(
+        "--background",
+        type=str,
+        required=True,
+        help="Path to background image.",
+    )
+    parser.add_argument(
+        "--mask",
+        type=str,
+        required=True,
+        help="Path to mask image (white=inpaint region).",
+    )
+    parser.add_argument("--output", type=str, default="out_sd3_maskcond.png")
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default="a high-resolution inspection photo of crack pattern on a material surface",
+    )
+    parser.add_argument(
+        "--negative_prompt",
+        type=str,
+        default="text, logo, watermark, people, objects, blur, lowres, painting, cartoon",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--steps", type=int, default=30)
+    parser.add_argument("--cfg", type=float, default=5.0)
+    parser.add_argument("--resolution", type=int, default=512)
+    parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["fp16", "bf16", "fp32"])
+    parser.add_argument("--mask_condition_scale", type=float, default=1.0)
+    parser.add_argument("--precondition_outputs", action="store_true")
+    parser.add_argument("--invert_mask", action="store_true")
+    return parser.parse_args()
+
+
+def build_mask_encoder(latent_channels: int) -> nn.Module:
+    return nn.Sequential(
+        nn.Conv2d(1, latent_channels, kernel_size=3, padding=1),
+        nn.SiLU(),
+        nn.Conv2d(latent_channels, latent_channels, kernel_size=3, padding=1),
+    )
+
+
+def encode_prompt(tokenizer1, tokenizer2, tokenizer3, te1, te2, te3, prompt: str, device: str, dtype: torch.dtype):
+    t1 = tokenizer1(prompt, padding="max_length", max_length=77, truncation=True, return_tensors="pt").input_ids.to(
+        device
+    )
+    out1 = te1(t1, output_hidden_states=True)
+    pooled1 = out1[0]
+    hid1 = out1.hidden_states[-2]
+
+    t2 = tokenizer2(prompt, padding="max_length", max_length=77, truncation=True, return_tensors="pt").input_ids.to(
+        device
+    )
+    out2 = te2(t2, output_hidden_states=True)
+    pooled2 = out2[0]
+    hid2 = out2.hidden_states[-2]
+
+    clip_hid = torch.cat([hid1, hid2], dim=-1)
+    pooled = torch.cat([pooled1, pooled2], dim=-1)
+
+    t3 = tokenizer3(
+        prompt, padding="max_length", max_length=77, truncation=True, add_special_tokens=True, return_tensors="pt"
+    ).input_ids.to(device)
+    t5 = te3(t3)[0]
+
+    if clip_hid.shape[-1] < t5.shape[-1]:
+        clip_hid = F.pad(clip_hid, (0, t5.shape[-1] - clip_hid.shape[-1]))
+    prompt_embeds = torch.cat([clip_hid, t5], dim=-2)
+    return prompt_embeds.to(dtype), pooled.to(dtype)
+
+
+@torch.no_grad()
+def main() -> None:
+    args = parse_args()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if args.mixed_precision == "bf16" else (
+        torch.float16 if args.mixed_precision == "fp16" else torch.float32
+    )
+
+    torch.manual_seed(args.seed)
+    generator = torch.Generator(device=device).manual_seed(args.seed)
+
+    tokenizer1 = CLIPTokenizer.from_pretrained(args.base, subfolder="tokenizer")
+    tokenizer2 = CLIPTokenizer.from_pretrained(args.base, subfolder="tokenizer_2")
+    tokenizer3 = T5TokenizerFast.from_pretrained(args.base, subfolder="tokenizer_3")
+
+    te1 = CLIPTextModelWithProjection.from_pretrained(args.base, subfolder="text_encoder").to(device, dtype=dtype)
+    te2 = CLIPTextModelWithProjection.from_pretrained(args.base, subfolder="text_encoder_2").to(device, dtype=dtype)
+    te3 = T5EncoderModel.from_pretrained(args.base, subfolder="text_encoder_3").to(device, dtype=dtype)
+
+    vae = AutoencoderKL.from_pretrained(args.base, subfolder="vae").to(device, dtype=torch.float32)
+    transformer = SD3Transformer2DModel.from_pretrained(args.base, subfolder="transformer").to(device, dtype=dtype)
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(args.base, subfolder="scheduler")
+
+    from diffusers import StableDiffusion3Pipeline
+    from diffusers.utils import convert_unet_state_dict_to_peft
+    from peft import LoraConfig, set_peft_model_state_dict
+
+    lora_state = StableDiffusion3Pipeline.lora_state_dict(args.lora_dir)
+    target_modules = [
+        "attn.add_k_proj",
+        "attn.add_q_proj",
+        "attn.add_v_proj",
+        "attn.to_add_out",
+        "attn.to_k",
+        "attn.to_out.0",
+        "attn.to_q",
+        "attn.to_v",
+    ]
+    transformer.add_adapter(
+        LoraConfig(r=4, lora_alpha=4, lora_dropout=0.0, init_lora_weights="gaussian", target_modules=target_modules)
+    )
+    t_state = {k.replace("transformer.", ""): v for k, v in lora_state.items() if k.startswith("transformer.")}
+    t_state = convert_unet_state_dict_to_peft(t_state)
+    set_peft_model_state_dict(transformer, t_state, adapter_name="default")
+
+    mask_encoder = build_mask_encoder(vae.config.latent_channels).to(device, dtype=dtype)
+    mask_encoder_path = os.path.join(args.lora_dir, "mask_encoder.bin")
+    if os.path.exists(mask_encoder_path):
+        mask_encoder.load_state_dict(torch.load(mask_encoder_path, map_location="cpu"))
+    else:
+        raise FileNotFoundError(f"mask_encoder.bin not found at: {mask_encoder_path}")
+
+    image = Image.open(args.background).convert("RGB")
+    mask = Image.open(args.mask).convert("L")
+    if args.invert_mask:
+        mask = ImageOps.invert(mask)
+
+    image = image.resize((args.resolution, args.resolution), resample=Image.BICUBIC)
+    mask = mask.resize((args.resolution, args.resolution), resample=Image.NEAREST)
+    mask = mask.point(lambda p: 255 if p > 127 else 0)
+
+    img = torch.from_numpy(np.array(image)).permute(2, 0, 1).float() / 255.0
+    img = img * 2.0 - 1.0
+    img = img.unsqueeze(0).to(device=device, dtype=torch.float32)
+
+    m = torch.from_numpy(np.array(mask)).float() / 255.0
+    m = (m > 0.5).unsqueeze(0).unsqueeze(0).to(device=device, dtype=dtype)
+
+    prompt_embeds, pooled = encode_prompt(
+        tokenizer1, tokenizer2, tokenizer3, te1, te2, te3, args.prompt, device, dtype
+    )
+    negative_prompt = args.negative_prompt or ""
+    negative_embeds, negative_pooled = encode_prompt(
+        tokenizer1, tokenizer2, tokenizer3, te1, te2, te3, negative_prompt, device, dtype
+    )
+
+    latents = vae.encode(img).latent_dist.sample(generator=generator)
+    latents = (latents - vae.config.shift_factor) * vae.config.scaling_factor
+    latents = latents.to(dtype)
+
+    scheduler.set_timesteps(args.steps, device=device)
+    timesteps = scheduler.timesteps.to(device)
+    sigmas_all = scheduler.sigmas.to(device=device, dtype=latents.dtype)
+
+    batch_size = latents.shape[0]
+    noise = torch.randn(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
+    x0 = (1 - m.to(latents.dtype)) * latents + m.to(latents.dtype) * noise
+    x1 = latents
+    x = noise.clone()
+
+    mask_latents = F.interpolate(m, size=latents.shape[-2:], mode="nearest").to(latents.dtype)
+    feat = mask_encoder(mask_latents) if args.mask_condition_scale != 0 else None
+
+    for i, t in enumerate(timesteps):
+        t_batch = t.expand(batch_size)
+        sigma = sigmas_all[i].view(1, 1, 1, 1)
+
+        zt = (1.0 - sigma) * x0 + sigma * x1
+        if feat is not None:
+            zt = zt + args.mask_condition_scale * feat
+
+        zt_input = torch.cat([zt, zt], dim=0)
+        t_input = torch.cat([t_batch, t_batch], dim=0)
+        encoder_states = torch.cat([negative_embeds, prompt_embeds], dim=0)
+        pooled_states = torch.cat([negative_pooled, pooled], dim=0)
+
+        model_pred = transformer(
+            hidden_states=zt_input,
+            timestep=t_input,
+            encoder_hidden_states=encoder_states,
+            pooled_projections=pooled_states,
+            return_dict=False,
+        )[0]
+
+        if args.precondition_outputs:
+            model_pred = model_pred * (-sigma) + zt_input
+
+        pred_uncond, pred_text = model_pred.chunk(2, dim=0)
+        x = pred_uncond + args.cfg * (pred_text - pred_uncond)
+
+    x = x.to(torch.float32)
+    x = x / vae.config.scaling_factor + vae.config.shift_factor
+    out = vae.decode(x).sample
+    out = (out / 2 + 0.5).clamp(0, 1)
+    out = (out[0].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    Image.fromarray(out).save(args.output)
+    print("Saved:", args.output)
+
+
+if __name__ == "__main__":
+    main()

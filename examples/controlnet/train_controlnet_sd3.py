@@ -762,7 +762,8 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
                 rel_paths = [line.strip() for line in handle if line.strip()]
 
             def replace_path_part(path_value, source_name, target_name):
-                parts = list(Path(path_value).parts)
+                normalized_value = path_value.replace("\\", "/")
+                parts = list(Path(normalized_value).parts)
                 if source_name in parts:
                     source_index = parts.index(source_name)
                     parts[source_index] = target_name

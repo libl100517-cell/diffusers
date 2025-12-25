@@ -588,6 +588,12 @@ def parse_args(input_args=None):
         help="Folder name to use when deriving mask paths from image paths.",
     )
     parser.add_argument(
+        "--mask_extension",
+        type=str,
+        default=".png",
+        help="File extension to use for derived mask paths (e.g. .png).",
+    )
+    parser.add_argument(
         "--mask_threshold",
         type=int,
         default=0,
@@ -776,9 +782,11 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
             image_paths = [
                 str(Path(args.train_data_root) / rel_path).replace("\\", "/") for rel_path in rel_paths
             ]
-            mask_rel_paths = [
-                replace_path_part(rel_path, args.image_folder_name, args.mask_folder_name) for rel_path in rel_paths
-            ]
+            mask_rel_paths = []
+            for rel_path in rel_paths:
+                mask_path = replace_path_part(rel_path, args.image_folder_name, args.mask_folder_name)
+                mask_path = str(Path(mask_path).with_suffix(args.mask_extension))
+                mask_rel_paths.append(mask_path)
             mask_paths = [
                 str(Path(args.train_data_root) / rel_path).replace("\\", "/") for rel_path in mask_rel_paths
             ]

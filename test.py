@@ -189,56 +189,53 @@ def main() -> None:
     sigmas_all = scheduler.sigmas.to(device=device, dtype=latents.dtype)
 
     batch_size = latents.shape[0]
-    noise = torch.randn(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
     m_latent = F.interpolate(m, size=latents.shape[-2:], mode="nearest").to(latents.dtype)
-    x0 = (1 - m_latent) * latents + m_latent * noise
-    latents = x0
+    x_bg = latents
+    noise0 = torch.randn(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
+    x0 = (1 - m_latent) * x_bg + m_latent * noise0
+    x1_hat = x0.clone()
 
-    mask_latents = F.interpolate(m, size=latents.shape[-2:], mode="nearest").to(latents.dtype)
-    feat = mask_encoder(mask_latents) if args.mask_condition_scale != 0 else None
+    feat = mask_encoder(m_latent) if args.mask_condition_scale != 0 else None
 
     for i, t in enumerate(timesteps):
-        t_batch = t.expand(batch_size)
         sigma = sigmas_all[i].view(1, 1, 1, 1)
-
-        latent_model_input = latents
-        if args.cfg != 1.0:
-            latent_model_input = torch.cat([latent_model_input, latent_model_input], dim=0)
-            t_batch = torch.cat([t_batch, t_batch], dim=0)
-            encoder_states = torch.cat([negative_embeds, prompt_embeds], dim=0)
-            pooled_states = torch.cat([negative_pooled, pooled], dim=0)
-        else:
-            encoder_states = prompt_embeds
-            pooled_states = pooled
+        xt = (1.0 - sigma) * x0 + sigma * x1_hat
 
         if feat is not None:
-            if args.cfg != 1.0:
-                feat_input = torch.cat([feat, feat], dim=0)
-            else:
-                feat_input = feat
-            latent_model_input = latent_model_input + args.mask_condition_scale * feat_input
+            xt = xt + args.mask_condition_scale * feat
 
-        model_pred = transformer(
-            hidden_states=latent_model_input,
-            timestep=t_batch,
-            encoder_hidden_states=encoder_states,
-            pooled_projections=pooled_states,
+        if args.cfg != 1.0:
+            xt_in = torch.cat([xt, xt], dim=0)
+            t_in = torch.cat([t.expand(batch_size), t.expand(batch_size)], dim=0)
+            enc = torch.cat([negative_embeds, prompt_embeds], dim=0)
+            pool = torch.cat([negative_pooled, pooled], dim=0)
+        else:
+            xt_in = xt
+            t_in = t.expand(batch_size)
+            enc = prompt_embeds
+            pool = pooled
+
+        pred = transformer(
+            hidden_states=xt_in,
+            timestep=t_in,
+            encoder_hidden_states=enc,
+            pooled_projections=pool,
             return_dict=False,
         )[0]
 
         if args.precondition_outputs:
-            if args.cfg != 1.0:
-                model_pred = model_pred * (-sigma) + latent_model_input
-            else:
-                model_pred = model_pred * (-sigma) + latent_model_input
+            pred = pred * (-sigma) + xt_in
 
         if args.cfg != 1.0:
-            pred_uncond, pred_text = model_pred.chunk(2, dim=0)
-            noise_pred = pred_uncond + args.cfg * (pred_text - pred_uncond)
+            pred_uncond, pred_text = pred.chunk(2, dim=0)
+            pred_cfg = pred_uncond + args.cfg * (pred_text - pred_uncond)
         else:
-            noise_pred = model_pred
+            pred_cfg = pred
 
-        latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+        x1_hat = x0 + pred_cfg
+        x1_hat = (1 - m_latent) * x_bg + m_latent * x1_hat
+
+    latents = x1_hat
 
     latents = latents.to(torch.float32)
     latents = latents / vae.config.scaling_factor + vae.config.shift_factor

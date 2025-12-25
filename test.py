@@ -192,8 +192,7 @@ def main() -> None:
     noise = torch.randn(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
     m_latent = F.interpolate(m, size=latents.shape[-2:], mode="nearest").to(latents.dtype)
     x0 = (1 - m_latent) * latents + m_latent * noise
-    x1 = latents
-    x = noise.clone()
+    latents = x0
 
     mask_latents = F.interpolate(m, size=latents.shape[-2:], mode="nearest").to(latents.dtype)
     feat = mask_encoder(mask_latents) if args.mask_condition_scale != 0 else None
@@ -202,28 +201,44 @@ def main() -> None:
         t_batch = t.expand(batch_size)
         sigma = sigmas_all[i].view(1, 1, 1, 1)
 
-        zt = (1.0 - sigma) * x0 + sigma * x1
-        if feat is not None:
-            zt = zt + args.mask_condition_scale * feat
+        latent_model_input = latents
+        if args.cfg != 1.0:
+            latent_model_input = torch.cat([latent_model_input, latent_model_input], dim=0)
+            t_batch = torch.cat([t_batch, t_batch], dim=0)
+            encoder_states = torch.cat([negative_embeds, prompt_embeds], dim=0)
+            pooled_states = torch.cat([negative_pooled, pooled], dim=0)
+        else:
+            encoder_states = prompt_embeds
+            pooled_states = pooled
 
-        zt_input = torch.cat([zt, zt], dim=0)
-        t_input = torch.cat([t_batch, t_batch], dim=0)
-        encoder_states = torch.cat([negative_embeds, prompt_embeds], dim=0)
-        pooled_states = torch.cat([negative_pooled, pooled], dim=0)
+        if feat is not None:
+            if args.cfg != 1.0:
+                feat_input = torch.cat([feat, feat], dim=0)
+            else:
+                feat_input = feat
+            latent_model_input = latent_model_input + args.mask_condition_scale * feat_input
 
         model_pred = transformer(
-            hidden_states=zt_input,
-            timestep=t_input,
+            hidden_states=latent_model_input,
+            timestep=t_batch,
             encoder_hidden_states=encoder_states,
             pooled_projections=pooled_states,
             return_dict=False,
         )[0]
 
         if args.precondition_outputs:
-            model_pred = model_pred * (-sigma) + zt_input
+            if args.cfg != 1.0:
+                model_pred = model_pred * (-sigma) + latent_model_input
+            else:
+                model_pred = model_pred * (-sigma) + latent_model_input
 
-        pred_uncond, pred_text = model_pred.chunk(2, dim=0)
-        x = pred_uncond + args.cfg * (pred_text - pred_uncond)
+        if args.cfg != 1.0:
+            pred_uncond, pred_text = model_pred.chunk(2, dim=0)
+            noise_pred = pred_uncond + args.cfg * (pred_text - pred_uncond)
+        else:
+            noise_pred = model_pred
+
+        latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
     x = x.to(torch.float32)
     x = x / vae.config.scaling_factor + vae.config.shift_factor

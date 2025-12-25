@@ -760,6 +760,7 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
         else:
             with open(args.train_data_list, "r", encoding="utf-8") as handle:
                 rel_paths = [line.strip() for line in handle if line.strip()]
+            rel_paths = [path.replace("\\", "/") for path in rel_paths]
 
             def replace_path_part(path_value, source_name, target_name):
                 normalized_value = path_value.replace("\\", "/")
@@ -772,11 +773,15 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
                     f"Expected '{source_name}' to be a path component in '{path_value}' for mask derivation."
                 )
 
-            image_paths = [str(Path(args.train_data_root) / rel_path) for rel_path in rel_paths]
+            image_paths = [
+                str(Path(args.train_data_root) / rel_path).replace("\\", "/") for rel_path in rel_paths
+            ]
             mask_rel_paths = [
                 replace_path_part(rel_path, args.image_folder_name, args.mask_folder_name) for rel_path in rel_paths
             ]
-            mask_paths = [str(Path(args.train_data_root) / rel_path) for rel_path in mask_rel_paths]
+            mask_paths = [
+                str(Path(args.train_data_root) / rel_path).replace("\\", "/") for rel_path in mask_rel_paths
+            ]
             dataset = Dataset.from_dict(
                 {
                     "image_path": image_paths,
@@ -870,7 +875,8 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
 
     def load_image(value):
         if isinstance(value, str):
-            return Image.open(value)
+            normalized_value = value.replace("\\", "/")
+            return Image.open(normalized_value)
         return value
 
     def generate_low_frequency_noise(height, width):

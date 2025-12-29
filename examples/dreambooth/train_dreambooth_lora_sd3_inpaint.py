@@ -85,29 +85,7 @@ def import_model_class_from_model_name_or_path(
     raise ValueError(f"{model_class} is not supported.")
 
 
-def _encode_prompt_with_t5(text_encoder, tokenizer, max_sequence_length, prompt, device=None):
-    text_inputs = tokenizer(
-        prompt,
-        padding="max_length",
-        max_length=max_sequence_length,
-        truncation=True,
-        add_special_tokens=True,
-        return_tensors="pt",
-    )
-    text_input_ids = text_inputs.input_ids
-    prompt_embeds = text_encoder(text_input_ids.to(device))[0]
-
-    dtype = text_encoder.dtype
-    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
-
-    _, seq_len, _ = prompt_embeds.shape
-    prompt_embeds = prompt_embeds.repeat(1, 1, 1)
-    prompt_embeds = prompt_embeds.view(prompt_embeds.shape[0], seq_len, -1)
-
-    return prompt_embeds
-
-
-def _encode_prompt_with_clip(text_encoder, tokenizer, prompt: str, device=None):
+def tokenize_prompt(tokenizer, prompt):
     text_inputs = tokenizer(
         prompt,
         padding="max_length",
@@ -115,8 +93,70 @@ def _encode_prompt_with_clip(text_encoder, tokenizer, prompt: str, device=None):
         truncation=True,
         return_tensors="pt",
     )
-
     text_input_ids = text_inputs.input_ids
+    return text_input_ids
+
+
+def _encode_prompt_with_t5(
+    text_encoder,
+    tokenizer,
+    max_sequence_length,
+    prompt=None,
+    num_images_per_prompt=1,
+    device=None,
+    text_input_ids=None,
+):
+    prompt = [prompt] if isinstance(prompt, str) else prompt
+    batch_size = len(prompt)
+
+    if tokenizer is not None:
+        text_inputs = tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_tensors="pt",
+        )
+        text_input_ids = text_inputs.input_ids
+    else:
+        if text_input_ids is None:
+            raise ValueError("text_input_ids must be provided when the tokenizer is not specified")
+    prompt_embeds = text_encoder(text_input_ids.to(device))[0]
+
+    dtype = text_encoder.dtype
+    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+
+    _, seq_len, _ = prompt_embeds.shape
+    prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+    prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+
+    return prompt_embeds
+
+
+def _encode_prompt_with_clip(
+    text_encoder,
+    tokenizer,
+    prompt: str,
+    device=None,
+    text_input_ids=None,
+    num_images_per_prompt: int = 1,
+):
+    prompt = [prompt] if isinstance(prompt, str) else prompt
+    batch_size = len(prompt)
+
+    if tokenizer is not None:
+        text_inputs = tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=77,
+            truncation=True,
+            return_tensors="pt",
+        )
+        text_input_ids = text_inputs.input_ids
+    else:
+        if text_input_ids is None:
+            raise ValueError("text_input_ids must be provided when the tokenizer is not specified")
     prompt_embeds = text_encoder(text_input_ids.to(device), output_hidden_states=True)
 
     pooled_prompt_embeds = prompt_embeds[0]
@@ -124,24 +164,36 @@ def _encode_prompt_with_clip(text_encoder, tokenizer, prompt: str, device=None):
     prompt_embeds = prompt_embeds.to(dtype=text_encoder.dtype, device=device)
 
     _, seq_len, _ = prompt_embeds.shape
-    prompt_embeds = prompt_embeds.repeat(1, 1, 1)
-    prompt_embeds = prompt_embeds.view(prompt_embeds.shape[0], seq_len, -1)
+    prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+    prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
 
     return prompt_embeds, pooled_prompt_embeds
 
 
-def encode_prompt(text_encoders, tokenizers, prompt, max_sequence_length, device=None):
+def encode_prompt(
+    text_encoders,
+    tokenizers,
+    prompt: str,
+    max_sequence_length,
+    device=None,
+    num_images_per_prompt: int = 1,
+    text_input_ids_list=None,
+):
+    prompt = [prompt] if isinstance(prompt, str) else prompt
+
     clip_tokenizers = tokenizers[:2]
     clip_text_encoders = text_encoders[:2]
 
     clip_prompt_embeds_list = []
     clip_pooled_prompt_embeds_list = []
-    for tokenizer, text_encoder in zip(clip_tokenizers, clip_text_encoders):
+    for i, (tokenizer, text_encoder) in enumerate(zip(clip_tokenizers, clip_text_encoders)):
         prompt_embeds, pooled_prompt_embeds = _encode_prompt_with_clip(
             text_encoder=text_encoder,
             tokenizer=tokenizer,
             prompt=prompt,
-            device=device,
+            device=device if device is not None else text_encoder.device,
+            num_images_per_prompt=num_images_per_prompt,
+            text_input_ids=text_input_ids_list[i] if text_input_ids_list else None,
         )
         clip_prompt_embeds_list.append(prompt_embeds)
         clip_pooled_prompt_embeds_list.append(pooled_prompt_embeds)
@@ -154,9 +206,14 @@ def encode_prompt(text_encoders, tokenizers, prompt, max_sequence_length, device
         tokenizer=tokenizers[-1],
         max_sequence_length=max_sequence_length,
         prompt=prompt,
-        device=device,
+        num_images_per_prompt=num_images_per_prompt,
+        device=device if device is not None else text_encoders[-1].device,
+        text_input_ids=text_input_ids_list[-1] if text_input_ids_list else None,
     )
 
+    clip_prompt_embeds = torch.nn.functional.pad(
+        clip_prompt_embeds, (0, t5_prompt_embed.shape[-1] - clip_prompt_embeds.shape[-1])
+    )
     prompt_embeds = torch.cat([clip_prompt_embeds, t5_prompt_embed], dim=-2)
     return prompt_embeds, pooled_prompt_embeds
 
@@ -342,6 +399,12 @@ def parse_args(input_args=None):
     parser.add_argument("--background_loss_weight", type=float, default=0.1)
     parser.add_argument("--default_prompt", type=str, default="")
     parser.add_argument("--resolution", type=int, default=1024)
+    parser.add_argument(
+        "--max_sequence_length",
+        type=int,
+        default=77,
+        help="Maximum sequence length to use with with the T5 text encoder",
+    )
     parser.add_argument("--train_batch_size", type=int, default=1)
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--max_train_steps", type=int, default=None)
@@ -598,7 +661,7 @@ def main(args):
                     text_encoders,
                     tokenizers,
                     batch["prompts"],
-                    max_sequence_length=256,
+                    max_sequence_length=args.max_sequence_length,
                     device=accelerator.device,
                 )
                 prompt_embeds = prompt_embeds.to(dtype=weight_dtype)

@@ -38,12 +38,11 @@ from huggingface_hub import create_repo, upload_folder
 from huggingface_hub.utils import insecure_hashlib
 from peft import LoraConfig, set_peft_model_state_dict
 from peft.utils import get_peft_model_state_dict
-from PIL import Image, ImageFilter
+from PIL import Image
 from PIL.ImageOps import exif_transpose
 from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
-from torchvision.transforms import functional as tvf
 from tqdm.auto import tqdm
 from transformers import CLIPTokenizer, PretrainedConfig, T5TokenizerFast
 
@@ -273,14 +272,10 @@ def parse_args(input_args=None):
     parser.add_argument("--train_data_list", type=str, required=True, help="Path to a text file listing images.")
     parser.add_argument("--train_data_root", type=str, required=True, help="Root directory for the listed images.")
     parser.add_argument("--image_folder_name", type=str, default="images")
-    parser.add_argument("--mask_folder_name", type=str, default="masks")
-    parser.add_argument("--mask_extension", type=str, default=".png")
+    parser.add_argument("--mask2_folder_name", type=str, default="masks2")
+    parser.add_argument("--mask2_extension", type=str, default=".png")
+    parser.add_argument("--mask2_count", type=int, default=4)
     parser.add_argument("--mask_threshold", type=int, default=0)
-    parser.add_argument("--mask_dilate_radius", type=int, default=5)
-    parser.add_argument("--mask2_rotate", type=float, default=15.0)
-    parser.add_argument("--mask2_translate", type=float, default=0.15)
-    parser.add_argument("--mask2_scale_min", type=float, default=0.8)
-    parser.add_argument("--mask2_scale_max", type=float, default=1.2)
     parser.add_argument("--noise_downsample", type=int, default=8)
     parser.add_argument("--mask_loss_weight", type=float, default=1.0)
     parser.add_argument("--background_loss_weight", type=float, default=0.1)
@@ -664,8 +659,8 @@ def parse_args(input_args=None):
         if args.class_prompt is not None:
             warnings.warn("You need not use --class_prompt without --with_prior_preservation.")
 
-    if args.mask_extension and not args.mask_extension.startswith("."):
-        args.mask_extension = f".{args.mask_extension}"
+    if args.mask2_extension and not args.mask2_extension.startswith("."):
+        args.mask2_extension = f".{args.mask2_extension}"
 
     return args
 
@@ -690,14 +685,20 @@ class CrackInpaintDataset(Dataset):
         self.image_paths = [
             str(Path(args.train_data_root) / rel_path).replace("\\", "/") for rel_path in rel_paths
         ]
-        mask_rel_paths = []
+        mask2_rel_paths = []
         for rel_path in rel_paths:
-            mask_path = replace_path_part(rel_path, args.image_folder_name, args.mask_folder_name)
-            mask_path = str(Path(mask_path).with_suffix(args.mask_extension))
-            mask_rel_paths.append(mask_path)
-        self.mask_paths = [
-            str(Path(args.train_data_root) / rel_path).replace("\\", "/") for rel_path in mask_rel_paths
-        ]
+            mask2_base = replace_path_part(rel_path, args.image_folder_name, args.mask2_folder_name)
+            mask2_rel_paths.append(mask2_base)
+        self.mask2_paths = []
+        for rel_path in mask2_rel_paths:
+            mask2_paths = []
+            for mask2_index in range(args.mask2_count):
+                mask2_path = Path(rel_path)
+                mask2_path = mask2_path.with_name(f"{mask2_path.stem}_mask2_{mask2_index}").with_suffix(
+                    args.mask2_extension
+                )
+                mask2_paths.append(str(Path(args.train_data_root) / mask2_path).replace("\\", "/"))
+            self.mask2_paths.append(mask2_paths)
         self.args = args
         self.instance_prompt = args.instance_prompt
         self.custom_instance_prompts = None
@@ -776,52 +777,16 @@ class CrackInpaintDataset(Dataset):
 
         return Image.fromarray(image_array.astype(np.uint8))
 
-    def _build_train_mask(self, crack_mask):
-        if crack_mask.mode != "L":
-            crack_mask = crack_mask.convert("L")
-
-        mask_array = np.array(crack_mask) > self.args.mask_threshold
-        crack_mask = Image.fromarray(mask_array.astype(np.uint8) * 255)
-
-        if self.args.mask2_rotate > 0 or self.args.mask2_translate > 0 or self.args.mask2_scale_min != 1.0:
-            angle = random.uniform(-self.args.mask2_rotate, self.args.mask2_rotate)
-            translate = (
-                int(random.uniform(-self.args.mask2_translate, self.args.mask2_translate) * crack_mask.size[0]),
-                int(random.uniform(-self.args.mask2_translate, self.args.mask2_translate) * crack_mask.size[1]),
-            )
-            scale = random.uniform(self.args.mask2_scale_min, self.args.mask2_scale_max)
-            mask2 = tvf.affine(
-                crack_mask,
-                angle=angle,
-                translate=translate,
-                scale=scale,
-                shear=0.0,
-                interpolation=InterpolationMode.NEAREST,
-                fill=0,
-            )
-        else:
-            mask2 = crack_mask.copy()
-
-        if self.args.mask_dilate_radius > 0:
-            kernel_size = self.args.mask_dilate_radius * 2 + 1
-            dilated = crack_mask.filter(ImageFilter.MaxFilter(kernel_size))
-        else:
-            dilated = crack_mask
-
-        mask2_array = np.array(mask2) > self.args.mask_threshold
-        dilated_array = np.array(dilated) > self.args.mask_threshold
-        train_mask_array = mask2_array & (~dilated_array)
-
-        if not train_mask_array.any():
-            train_mask_array = mask2_array
-
-        return Image.fromarray(train_mask_array.astype(np.uint8) * 255)
+    def _load_train_mask(self, index):
+        mask2_paths = self.mask2_paths[index % self.num_instance_images]
+        mask2_path = random.choice(mask2_paths)
+        if not os.path.exists(mask2_path):
+            raise FileNotFoundError(f"Missing precomputed mask2 file: {mask2_path}")
+        return Image.open(mask2_path).convert("L")
 
     def __getitem__(self, index):
         image = Image.open(self.image_paths[index % self.num_instance_images]).convert("RGB")
-        mask = Image.open(self.mask_paths[index % self.num_instance_images]).convert("L")
-
-        train_mask = self._build_train_mask(mask)
+        train_mask = self._load_train_mask(index)
         masked_image = self._apply_masked_noise(image, train_mask)
 
         pixel_values = self.image_transforms(image)

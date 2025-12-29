@@ -28,6 +28,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator, DistributedType
@@ -44,7 +45,8 @@ from torchvision import transforms
 from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm
 from transformers import CLIPTokenizer, PretrainedConfig, T5TokenizerFast
-
+from torch.nn import functional as F
+from tensorboardX import SummaryWriter
 import diffusers
 from diffusers import (
     AutoencoderKL,
@@ -290,6 +292,24 @@ def parse_args(input_args=None):
         default=None,
         help=("A folder containing the training data. "),
     )
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        default=None,
+        help="Root directory for training data when using --train_data_txt.",
+    )
+    parser.add_argument(
+        "--train_data_txt",
+        type=str,
+        default=None,
+        help="Path to train.txt listing instance image paths relative to --data_root.",
+    )
+    parser.add_argument(
+        "--mask_data_dir",
+        type=str,
+        default=None,
+        help="A folder containing mask images aligned with the instance_data_dir images.",
+    )
 
     parser.add_argument(
         "--cache_dir",
@@ -305,6 +325,12 @@ def parse_args(input_args=None):
         help="The column of the dataset containing the target image. By "
         "default, the standard Image Dataset maps out 'file_name' "
         "to 'image'.",
+    )
+    parser.add_argument(
+        "--mask_column",
+        type=str,
+        default=None,
+        help="The column of the dataset containing the inpainting mask.",
     )
     parser.add_argument(
         "--caption_column",
@@ -356,7 +382,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--validation_epochs",
         type=int,
-        default=50,
+        default=5,
         help=(
             "Run dreambooth validation every X epochs. Dreambooth validation consists of running the prompt"
             " `args.validation_prompt` multiple times: `args.num_validation_images`."
@@ -424,12 +450,12 @@ def parse_args(input_args=None):
     )
 
     parser.add_argument(
-        "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=32, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
-        "--sample_batch_size", type=int, default=4, help="Batch size (per device) for sampling images."
+        "--sample_batch_size", type=int, default=32, help="Batch size (per device) for sampling images."
     )
-    parser.add_argument("--num_train_epochs", type=int, default=1)
+    parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
         "--max_train_steps",
         type=int,
@@ -658,7 +684,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default=None,
+        default="bf16",
         choices=["no", "fp16", "bf16"],
         help=(
             "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
@@ -678,12 +704,29 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--prior_generation_precision",
         type=str,
-        default=None,
+        default="bf16",
         choices=["no", "fp32", "fp16", "bf16"],
         help=(
             "Choose prior generation precision between fp32, fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
             " 1.10.and an Nvidia Ampere GPU.  Default to  fp16 if a GPU is available else fp32."
         ),
+    )
+    parser.add_argument(
+        "--mask_conditioning_scale",
+        type=float,
+        default=1.0,
+        help="Scaling factor for adding mask features into the transformer input.",
+    )
+    parser.add_argument(
+        "--mask_out_loss_weight",
+        type=float,
+        default=0.0,
+        help="Weight for suppressing predictions outside the mask. Set to > 0 to enable.",
+    )
+    parser.add_argument(
+        "--masked_noise_training",
+        action="store_true",
+        help="Use masked noise interpolation for flow matching targets.",
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
 
@@ -692,11 +735,16 @@ def parse_args(input_args=None):
     else:
         args = parser.parse_args()
 
-    if args.dataset_name is None and args.instance_data_dir is None:
-        raise ValueError("Specify either `--dataset_name` or `--instance_data_dir`")
+    if args.dataset_name is None and args.instance_data_dir is None and args.train_data_txt is None:
+        raise ValueError("Specify `--dataset_name`, `--instance_data_dir`, or `--train_data_txt`")
 
-    if args.dataset_name is not None and args.instance_data_dir is not None:
-        raise ValueError("Specify only one of `--dataset_name` or `--instance_data_dir`")
+    if sum(arg is not None for arg in [args.dataset_name, args.instance_data_dir, args.train_data_txt]) > 1:
+        raise ValueError("Specify only one of `--dataset_name`, `--instance_data_dir`, or `--train_data_txt`")
+    if args.dataset_name is None and args.mask_data_dir is None:
+        if args.train_data_txt is None:
+            raise ValueError("Specify `--mask_data_dir` when using `--instance_data_dir` for inpainting.")
+    if args.train_data_txt is not None and args.data_root is None:
+        raise ValueError("Specify `--data_root` when using `--train_data_txt`.")
 
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -730,6 +778,9 @@ class DreamBoothDataset(Dataset):
         class_prompt,
         class_data_root=None,
         class_num=None,
+        mask_data_root=None,
+        data_root=None,
+        train_data_txt=None,
         size=1024,
         repeats=1,
         center_crop=False,
@@ -774,6 +825,16 @@ class DreamBoothDataset(Dataset):
                         f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
                     )
             instance_images = dataset["train"][image_column]
+            if args.mask_column is None:
+                mask_column = "mask"
+                logger.info(f"mask column defaulting to {mask_column}")
+            else:
+                mask_column = args.mask_column
+                if mask_column not in column_names:
+                    raise ValueError(
+                        f"`--mask_column` value '{args.mask_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+                    )
+            instance_masks = dataset["train"][mask_column]
 
             if args.caption_column is None:
                 logger.info(
@@ -792,47 +853,92 @@ class DreamBoothDataset(Dataset):
                 self.custom_instance_prompts = []
                 for caption in custom_instance_prompts:
                     self.custom_instance_prompts.extend(itertools.repeat(caption, repeats))
+        elif train_data_txt is not None:
+            data_root = Path(data_root)
+            train_data_txt = Path(train_data_txt)
+            if not train_data_txt.exists():
+                raise ValueError("train.txt does not exist.")
+            if not data_root.exists():
+                raise ValueError("data_root does not exist.")
+
+            mask_dir_cache = {}
+
+            def get_mask_path(mask_dir, stem):
+                if mask_dir not in mask_dir_cache:
+                    stem_map = {}
+                    with os.scandir(mask_dir) as it:
+                        for entry in it:
+                            if entry.is_file():
+                                entry_path = Path(entry.path)
+                                stem_map.setdefault(entry_path.stem, entry_path)
+                    mask_dir_cache[mask_dir] = stem_map
+                return mask_dir_cache[mask_dir].get(stem)
+
+            instance_images = []
+            instance_masks = []
+            with train_data_txt.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    line = line.replace("\\", "/")
+                    image_path = data_root / line
+                    if not image_path.exists():
+                        raise ValueError(f"Instance image not found: {image_path}")
+                    if "images" not in image_path.parts:
+                        raise ValueError(f"Expected 'images' in path: {image_path}")
+                    mask_parts = list(image_path.parts)
+                    mask_parts[mask_parts.index("images")] = "masks"
+                    mask_dir = Path(*mask_parts[:-1])
+                    mask_path = get_mask_path(mask_dir, image_path.stem)
+                    if mask_path is None:
+                        raise ValueError(f"Mask not found for image {image_path}")
+                    instance_images.append(image_path)
+                    instance_masks.append(mask_path)
+            self.custom_instance_prompts = None
         else:
             self.instance_data_root = Path(instance_data_root)
             if not self.instance_data_root.exists():
                 raise ValueError("Instance images root doesn't exists.")
+            if mask_data_root is None:
+                raise ValueError("Mask images root doesn't exists.")
+            self.mask_data_root = Path(mask_data_root)
+            if not self.mask_data_root.exists():
+                raise ValueError("Mask images root doesn't exists.")
 
-            instance_images = [Image.open(path) for path in list(Path(instance_data_root).iterdir())]
+            image_paths = sorted([path for path in Path(instance_data_root).iterdir() if path.is_file()])
+            mask_paths = {}
+            with os.scandir(self.mask_data_root) as it:
+                for entry in it:
+                    if entry.is_file():
+                        entry_path = Path(entry.path)
+                        mask_paths.setdefault(entry_path.stem, entry_path)
+            instance_images = []
+            instance_masks = []
+            for image_path in image_paths:
+                mask_path = mask_paths.get(image_path.stem)
+                if mask_path is None:
+                    raise ValueError(f"Mask not found for image {image_path.name}.")
+                instance_images.append(image_path)
+                instance_masks.append(mask_path)
             self.custom_instance_prompts = None
 
-        self.instance_images = []
-        for img in instance_images:
-            self.instance_images.extend(itertools.repeat(img, repeats))
+        self.instance_pairs = []
+        for img, mask in zip(instance_images, instance_masks):
+            self.instance_pairs.extend(itertools.repeat((img, mask), repeats))
 
-        self.pixel_values = []
-        train_resize = transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR)
-        train_crop = transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size)
-        train_flip = transforms.RandomHorizontalFlip(p=1.0)
-        train_transforms = transforms.Compose(
+        self.train_resize = transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR)
+        self.mask_resize = transforms.Resize(size, interpolation=transforms.InterpolationMode.NEAREST)
+        self.train_crop = transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size)
+        self.train_flip = transforms.RandomHorizontalFlip(p=1.0)
+        self.train_transforms = transforms.Compose(
             [
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ]
         )
-        for image in self.instance_images:
-            image = exif_transpose(image)
-            if not image.mode == "RGB":
-                image = image.convert("RGB")
-            image = train_resize(image)
-            if args.random_flip and random.random() < 0.5:
-                # flip
-                image = train_flip(image)
-            if args.center_crop:
-                y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
-                x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
-                image = train_crop(image)
-            else:
-                y1, x1, h, w = train_crop.get_params(image, (args.resolution, args.resolution))
-                image = crop(image, y1, x1, h, w)
-            image = train_transforms(image)
-            self.pixel_values.append(image)
 
-        self.num_instance_images = len(self.instance_images)
+        self.num_instance_images = len(self.instance_pairs)
         self._length = self.num_instance_images
 
         if class_data_root is not None:
@@ -859,10 +965,40 @@ class DreamBoothDataset(Dataset):
     def __len__(self):
         return self._length
 
+    def _load_image(self, item, mode):
+        if isinstance(item, (str, Path)):
+            with Image.open(item) as image:
+                image = image.copy()
+        else:
+            image = item
+        image = exif_transpose(image)
+        if image.mode != mode:
+            image = image.convert(mode)
+        return image
+
     def __getitem__(self, index):
         example = {}
-        instance_image = self.pixel_values[index % self.num_instance_images]
+        instance_image, instance_mask = self.instance_pairs[index % self.num_instance_images]
+        instance_image = self._load_image(instance_image, "RGB")
+        instance_mask = self._load_image(instance_mask, "L")
+
+        instance_image = self.train_resize(instance_image)
+        instance_mask = self.mask_resize(instance_mask)
+        if args.random_flip and random.random() < 0.5:
+            instance_image = self.train_flip(instance_image)
+            instance_mask = self.train_flip(instance_mask)
+        if args.center_crop:
+            instance_image = self.train_crop(instance_image)
+            instance_mask = self.train_crop(instance_mask)
+        else:
+            y1, x1, h, w = self.train_crop.get_params(instance_image, (args.resolution, args.resolution))
+            instance_image = crop(instance_image, y1, x1, h, w)
+            instance_mask = crop(instance_mask, y1, x1, h, w)
+        instance_image = self.train_transforms(instance_image)
+        instance_mask = transforms.ToTensor()(instance_mask)
+        instance_mask = (instance_mask > 0.5).float()
         example["instance_images"] = instance_image
+        example["instance_masks"] = instance_mask
 
         if self.custom_instance_prompts:
             caption = self.custom_instance_prompts[index % self.num_instance_images]
@@ -875,11 +1011,11 @@ class DreamBoothDataset(Dataset):
             example["instance_prompt"] = self.instance_prompt
 
         if self.class_data_root:
-            class_image = Image.open(self.class_images_path[index % self.num_class_images])
-            class_image = exif_transpose(class_image)
-
-            if not class_image.mode == "RGB":
-                class_image = class_image.convert("RGB")
+            with Image.open(self.class_images_path[index % self.num_class_images]) as class_image:
+                class_image = exif_transpose(class_image)
+                if not class_image.mode == "RGB":
+                    class_image = class_image.convert("RGB")
+                class_image = class_image.copy()
             example["class_images"] = self.image_transforms(class_image)
             example["class_prompt"] = self.class_prompt
 
@@ -888,18 +1024,22 @@ class DreamBoothDataset(Dataset):
 
 def collate_fn(examples, with_prior_preservation=False):
     pixel_values = [example["instance_images"] for example in examples]
+    mask_values = [example["instance_masks"] for example in examples]
     prompts = [example["instance_prompt"] for example in examples]
 
     # Concat class and instance examples for prior preservation.
     # We do this to avoid doing two forward passes.
     if with_prior_preservation:
         pixel_values += [example["class_images"] for example in examples]
+        mask_values += [torch.zeros_like(example["instance_masks"]) for example in examples]
         prompts += [example["class_prompt"] for example in examples]
 
     pixel_values = torch.stack(pixel_values)
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+    mask_values = torch.stack(mask_values)
+    mask_values = mask_values.to(memory_format=torch.contiguous_format).float()
 
-    batch = {"pixel_values": pixel_values, "prompts": prompts}
+    batch = {"pixel_values": pixel_values, "mask_values": mask_values, "prompts": prompts}
     return batch
 
 
@@ -1076,7 +1216,7 @@ def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
-    kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -1240,6 +1380,13 @@ def main(args):
     text_encoder_two.to(accelerator.device, dtype=weight_dtype)
     text_encoder_three.to(accelerator.device, dtype=weight_dtype)
 
+    mask_encoder = nn.Sequential(
+        nn.Conv2d(1, vae.config.latent_channels, kernel_size=3, padding=1),
+        nn.SiLU(),
+        nn.Conv2d(vae.config.latent_channels, vae.config.latent_channels, kernel_size=3, padding=1),
+    )
+    mask_encoder.to(accelerator.device, dtype=weight_dtype)
+
     if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
         if args.train_text_encoder:
@@ -1296,6 +1443,7 @@ def main(args):
             transformer_lora_layers_to_save = None
             text_encoder_one_lora_layers_to_save = None
             text_encoder_two_lora_layers_to_save = None
+            mask_encoder_state_to_save = None
 
             for model in models:
                 if isinstance(unwrap_model(model), type(unwrap_model(transformer))):
@@ -1313,6 +1461,8 @@ def main(args):
                         text_encoder_one_lora_layers_to_save = get_peft_model_state_dict(model)
                     elif hidden_size == 1280:
                         text_encoder_two_lora_layers_to_save = get_peft_model_state_dict(model)
+                elif isinstance(unwrap_model(model), type(unwrap_model(mask_encoder))):
+                    mask_encoder_state_to_save = unwrap_model(model).state_dict()
                 else:
                     raise ValueError(f"unexpected save model: {model.__class__}")
 
@@ -1326,11 +1476,14 @@ def main(args):
                 text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
                 text_encoder_2_lora_layers=text_encoder_two_lora_layers_to_save,
             )
+            if mask_encoder_state_to_save is not None:
+                torch.save(mask_encoder_state_to_save, os.path.join(output_dir, "mask_encoder.bin"))
 
     def load_model_hook(models, input_dir):
         transformer_ = None
         text_encoder_one_ = None
         text_encoder_two_ = None
+        mask_encoder_ = None
 
         if not accelerator.distributed_type == DistributedType.DEEPSPEED:
             while len(models) > 0:
@@ -1342,6 +1495,8 @@ def main(args):
                     text_encoder_one_ = unwrap_model(model)
                 elif isinstance(unwrap_model(model), type(unwrap_model(text_encoder_two))):
                     text_encoder_two_ = unwrap_model(model)
+                elif isinstance(unwrap_model(model), type(unwrap_model(mask_encoder))):
+                    mask_encoder_ = unwrap_model(model)
                 else:
                     raise ValueError(f"unexpected save model: {model.__class__}")
 
@@ -1357,6 +1512,7 @@ def main(args):
                 text_encoder_two_ = text_encoder_cls_two.from_pretrained(
                     args.pretrained_model_name_or_path, subfolder="text_encoder_2"
                 )
+            mask_encoder_ = mask_encoder
 
         lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(input_dir)
 
@@ -1380,12 +1536,19 @@ def main(args):
             _set_state_dict_into_text_encoder(
                 lora_state_dict, prefix="text_encoder_2.", text_encoder=text_encoder_two_
             )
+        if mask_encoder_ is not None:
+            mask_path = os.path.join(input_dir, "mask_encoder.bin")
+            if os.path.exists(mask_path):
+                mask_state = torch.load(mask_path, map_location="cpu")
+                mask_encoder_.load_state_dict(mask_state)
 
         # Make sure the trainable params are in float32. This is again needed since the base models
         # are in `weight_dtype`. More details:
         # https://github.com/huggingface/diffusers/pull/6514#discussion_r1449796804
         if args.mixed_precision == "fp16":
             models = [transformer_]
+            if mask_encoder_ is not None:
+                models.append(mask_encoder_)
             if args.train_text_encoder:
                 models.extend([text_encoder_one_, text_encoder_two_])
             # only upcast trainable parameters (LoRA) into fp32
@@ -1406,19 +1569,21 @@ def main(args):
 
     # Make sure the trainable params are in float32.
     if args.mixed_precision == "fp16":
-        models = [transformer]
+        models = [transformer, mask_encoder]
         if args.train_text_encoder:
             models.extend([text_encoder_one, text_encoder_two])
         # only upcast trainable parameters (LoRA) into fp32
         cast_training_params(models, dtype=torch.float32)
 
     transformer_lora_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
+    mask_encoder_parameters = list(filter(lambda p: p.requires_grad, mask_encoder.parameters()))
     if args.train_text_encoder:
         text_lora_parameters_one = list(filter(lambda p: p.requires_grad, text_encoder_one.parameters()))
         text_lora_parameters_two = list(filter(lambda p: p.requires_grad, text_encoder_two.parameters()))
 
     # Optimization parameters
     transformer_parameters_with_lr = {"params": transformer_lora_parameters, "lr": args.learning_rate}
+    mask_encoder_parameters_with_lr = {"params": mask_encoder_parameters, "lr": args.learning_rate}
     if args.train_text_encoder:
         # different learning rate for text encoder and unet
         text_lora_parameters_one_with_lr = {
@@ -1433,11 +1598,12 @@ def main(args):
         }
         params_to_optimize = [
             transformer_parameters_with_lr,
+            mask_encoder_parameters_with_lr,
             text_lora_parameters_one_with_lr,
             text_lora_parameters_two_with_lr,
         ]
     else:
-        params_to_optimize = [transformer_parameters_with_lr]
+        params_to_optimize = [transformer_parameters_with_lr, mask_encoder_parameters_with_lr]
 
     # Optimizer creation
     if not (args.optimizer.lower() == "prodigy" or args.optimizer.lower() == "adamw"):
@@ -1514,6 +1680,9 @@ def main(args):
         class_prompt=args.class_prompt,
         class_data_root=args.class_data_dir if args.with_prior_preservation else None,
         class_num=args.num_class_images,
+        mask_data_root=args.mask_data_dir,
+        data_root=args.data_root,
+        train_data_txt=args.train_data_txt,
         size=args.resolution,
         repeats=args.repeats,
         center_crop=args.center_crop,
@@ -1624,18 +1793,19 @@ def main(args):
             transformer,
             text_encoder_one,
             text_encoder_two,
+            mask_encoder,
             optimizer,
             train_dataloader,
             lr_scheduler,
         ) = accelerator.prepare(
-            transformer, text_encoder_one, text_encoder_two, optimizer, train_dataloader, lr_scheduler
+            transformer, text_encoder_one, text_encoder_two, mask_encoder, optimizer, train_dataloader, lr_scheduler
         )
         assert text_encoder_one is not None
         assert text_encoder_two is not None
         assert text_encoder_three is not None
     else:
-        transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            transformer, optimizer, train_dataloader, lr_scheduler
+        transformer, mask_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            transformer, mask_encoder, optimizer, train_dataloader, lr_scheduler
         )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
@@ -1714,6 +1884,7 @@ def main(args):
 
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
+        mask_encoder.train()
         if args.train_text_encoder:
             text_encoder_one.train()
             text_encoder_two.train()
@@ -1723,7 +1894,7 @@ def main(args):
             accelerator.unwrap_model(text_encoder_two).text_model.embeddings.requires_grad_(True)
 
         for step, batch in enumerate(train_dataloader):
-            models_to_accumulate = [transformer]
+            models_to_accumulate = [transformer, mask_encoder]
             if args.train_text_encoder:
                 models_to_accumulate.extend([text_encoder_one, text_encoder_two])
             with accelerator.accumulate(models_to_accumulate):
@@ -1765,6 +1936,8 @@ def main(args):
 
                 model_input = (model_input - vae_config_shift_factor) * vae_config_scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
+                mask_values = batch["mask_values"].to(device=model_input.device, dtype=weight_dtype)
+                mask_latents = F.interpolate(mask_values, size=model_input.shape[-2:], mode="nearest")
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(model_input)
@@ -1785,7 +1958,15 @@ def main(args):
                 # Add noise according to flow matching.
                 # zt = (1 - texp) * x + texp * z1
                 sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
-                noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
+                if args.masked_noise_training:
+                    x0 = model_input
+                    x1 = (1 - mask_latents) * model_input + mask_latents * noise
+                    noisy_model_input = (1.0 - sigmas) * x0 + sigmas * x1
+                else:
+                    noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
+                if args.mask_conditioning_scale != 0:
+                    mask_features = mask_encoder(mask_latents)
+                    noisy_model_input = noisy_model_input + args.mask_conditioning_scale * mask_features
 
                 # Predict the noise residual
                 model_pred = transformer(
@@ -1806,10 +1987,16 @@ def main(args):
                 weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
 
                 # flow matching loss
-                if args.precondition_outputs:
-                    target = model_input
+                if args.masked_noise_training:
+                    if args.precondition_outputs:
+                        target = x0                # 关键：监督 x0
+                    else:
+                        target = x1 - x0           # 监督 velocity
                 else:
-                    target = noise - model_input
+                    if args.precondition_outputs:
+                        target = model_input       # 原版就是这样
+                    else:
+                        target = noise - model_input
 
                 if args.with_prior_preservation:
                     # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
@@ -1831,6 +2018,10 @@ def main(args):
                     1,
                 )
                 loss = loss.mean()
+                if args.mask_out_loss_weight > 0:
+                    mask_latents = mask_latents.to(dtype=model_pred.dtype)
+                    mask_suppression = ((1 - mask_latents) * model_pred).pow(2).mean()
+                    loss = loss + args.mask_out_loss_weight * mask_suppression
 
                 if args.with_prior_preservation:
                     # Add the prior loss to the instance loss.

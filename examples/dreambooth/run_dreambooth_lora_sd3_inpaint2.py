@@ -19,7 +19,7 @@ import os
 from pathlib import Path
 
 import torch
-from PIL import Image
+from PIL import Image, ImageFilter
 
 from diffusers import StableDiffusion3InpaintPipeline
 
@@ -32,6 +32,7 @@ def parse_args(input_args=None):
     parser.add_argument("--negative_prompt", type=str, default=None)
     parser.add_argument("--image", type=str, required=True, help="Path to the input image.")
     parser.add_argument("--mask", type=str, required=True, help="Path to the inpaint mask (white=replace).")
+    parser.add_argument("--mask_dilate_radius", type=int, default=0, help="Optional dilation radius for the mask.")
     parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--width", type=int, default=None)
@@ -71,6 +72,9 @@ def main(args):
 
     image = Image.open(args.image).convert("RGB")
     mask = Image.open(args.mask).convert("L")
+    if args.mask_dilate_radius > 0:
+        kernel_size = args.mask_dilate_radius * 2 + 1
+        mask = mask.filter(ImageFilter.MaxFilter(kernel_size))
 
     generator = None
     if args.seed is not None:

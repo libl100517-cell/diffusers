@@ -272,9 +272,8 @@ def parse_args(input_args=None):
     parser.add_argument("--train_data_list", type=str, required=True, help="Path to a text file listing images.")
     parser.add_argument("--train_data_root", type=str, required=True, help="Root directory for the listed images.")
     parser.add_argument("--image_folder_name", type=str, default="images")
-    parser.add_argument("--mask2_folder_name", type=str, default="masks2")
-    parser.add_argument("--mask2_extension", type=str, default=".png")
-    parser.add_argument("--mask2_count", type=int, default=4)
+    parser.add_argument("--mask_folder_name", type=str, default="masks")
+    parser.add_argument("--mask_extension", type=str, default=".png")
     parser.add_argument("--mask_threshold", type=int, default=0)
     parser.add_argument("--noise_downsample", type=int, default=8)
     parser.add_argument("--mask_loss_weight", type=float, default=1.0)
@@ -321,7 +320,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--validation_epochs",
         type=int,
-        default=5,
+        default=50,
         help=(
             "Run dreambooth validation every X epochs. Dreambooth validation consists of running the prompt"
             " `args.validation_prompt` multiple times: `args.num_validation_images`."
@@ -362,7 +361,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resolution",
         type=int,
-        default=512,
+        default=1024,
         help=(
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
@@ -375,12 +374,12 @@ def parse_args(input_args=None):
     )
 
     parser.add_argument(
-        "--train_batch_size", type=int, default=32, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
-        "--sample_batch_size", type=int, default=32, help="Batch size (per device) for sampling images."
+        "--sample_batch_size", type=int, default=4, help="Batch size (per device) for sampling images."
     )
-    parser.add_argument("--num_train_epochs", type=int, default=100)
+    parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument(
         "--max_train_steps",
         type=int,
@@ -390,7 +389,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=100,
+        default=500,
         help=(
             "Save a checkpoint of the training state every X updates. These checkpoints can be used both as final"
             " checkpoints in case they are better than the last checkpoint, and are also suitable for resuming"
@@ -609,7 +608,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default="bf16",
+        default=None,
         choices=["no", "fp16", "bf16"],
         help=(
             "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
@@ -629,7 +628,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--prior_generation_precision",
         type=str,
-        default="bf16",
+        default=None,
         choices=["no", "fp32", "fp16", "bf16"],
         help=(
             "Choose prior generation precision between fp32, fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
@@ -659,8 +658,8 @@ def parse_args(input_args=None):
         if args.class_prompt is not None:
             warnings.warn("You need not use --class_prompt without --with_prior_preservation.")
 
-    if args.mask2_extension and not args.mask2_extension.startswith("."):
-        args.mask2_extension = f".{args.mask2_extension}"
+    if args.mask_extension and not args.mask_extension.startswith("."):
+        args.mask_extension = f".{args.mask_extension}"
 
     return args
 
@@ -685,20 +684,14 @@ class CrackInpaintDataset(Dataset):
         self.image_paths = [
             str(Path(args.train_data_root) / rel_path).replace("\\", "/") for rel_path in rel_paths
         ]
-        mask2_rel_paths = []
+        mask_rel_paths = []
         for rel_path in rel_paths:
-            mask2_base = replace_path_part(rel_path, args.image_folder_name, args.mask2_folder_name)
-            mask2_rel_paths.append(mask2_base)
-        self.mask2_paths = []
-        for rel_path in mask2_rel_paths:
-            mask2_paths = []
-            for mask2_index in range(args.mask2_count):
-                mask2_path = Path(rel_path)
-                mask2_path = mask2_path.with_name(f"{mask2_path.stem}_mask2_{mask2_index}").with_suffix(
-                    args.mask2_extension
-                )
-                mask2_paths.append(str(Path(args.train_data_root) / mask2_path).replace("\\", "/"))
-            self.mask2_paths.append(mask2_paths)
+            mask_path = replace_path_part(rel_path, args.image_folder_name, args.mask_folder_name)
+            mask_path = str(Path(mask_path).with_suffix(args.mask_extension))
+            mask_rel_paths.append(mask_path)
+        self.mask_paths = [
+            str(Path(args.train_data_root) / rel_path).replace("\\", "/") for rel_path in mask_rel_paths
+        ]
         self.args = args
         self.instance_prompt = args.instance_prompt
         self.custom_instance_prompts = None
@@ -754,11 +747,10 @@ class CrackInpaintDataset(Dataset):
         return Image.fromarray(image_array.astype(np.uint8))
 
     def _load_train_mask(self, index):
-        mask2_paths = self.mask2_paths[index % self.num_instance_images]
-        mask2_path = random.choice(mask2_paths)
-        if not os.path.exists(mask2_path):
-            raise FileNotFoundError(f"Missing precomputed mask2 file: {mask2_path}")
-        return Image.open(mask2_path).convert("L")
+        mask_path = self.mask_paths[index % self.num_instance_images]
+        if not os.path.exists(mask_path):
+            raise FileNotFoundError(f"Missing mask file: {mask_path}")
+        return Image.open(mask_path).convert("L")
 
     def __getitem__(self, index):
         image = Image.open(self.image_paths[index % self.num_instance_images]).convert("RGB")

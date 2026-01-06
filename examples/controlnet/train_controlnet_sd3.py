@@ -31,6 +31,7 @@ from PIL import Image, ImageOps
 import accelerate
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
@@ -602,8 +603,8 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--default_prompt",
         type=str,
-        default="",
-        help="Default prompt to use when loading images from `--train_data_list`.",
+        default="crack",
+        help="Default prompt to use for all training images.",
     )
     parser.add_argument(
         "--image_column", type=str, default="image", help="The column of the dataset containing the target image."
@@ -843,18 +844,11 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
 
     def process_captions(examples, is_train=True):
         captions = []
-        for caption in examples[caption_column]:
+        for _ in range(len(examples[image_column])):
             if random.random() < args.proportion_empty_prompts:
                 captions.append("")
-            elif isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
             else:
-                raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
-                )
+                captions.append(args.default_prompt)
         return captions
 
     image_transforms = transforms.Compose(
@@ -933,13 +927,15 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
 
         masks = [load_image(image) for image in examples[conditioning_image_column]]
         if args.use_inpainting_conditioning:
-            masked_images = [apply_masked_noise(image, mask) for image, mask in zip(raw_images, masks)]
-            conditioning_images = [conditioning_image_transforms(image) for image in masked_images]
+            conditioning_images = [image_transforms(image) for image in raw_images]
             mask_tensors = [mask_transforms(mask.convert("L")) for mask in masks]
-            conditioning_pixel_values = [
-                torch.cat([conditioning_image, mask_tensor], dim=0)
-                for conditioning_image, mask_tensor in zip(conditioning_images, mask_tensors)
-            ]
+            threshold = args.mask_threshold / 255.0
+            mask_tensors = [(mask_tensor > threshold).float() for mask_tensor in mask_tensors]
+            conditioning_pixel_values = []
+            for conditioning_image, mask_tensor in zip(conditioning_images, mask_tensors):
+                masked_image = conditioning_image.clone()
+                masked_image[mask_tensor.repeat(3, 1, 1) > 0.5] = -1.0
+                conditioning_pixel_values.append(torch.cat([masked_image, mask_tensor], dim=0))
         else:
             if args.train_data_list is not None:
                 conditioning_images = [apply_masked_noise(image, mask) for image, mask in zip(raw_images, masks)]
@@ -962,15 +958,21 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
     return train_dataset
 
 
-def collate_fn(examples):
+def collate_fn(examples, default_prompt_embeds=None, default_pooled_prompt_embeds=None):
     pixel_values = torch.stack([example["pixel_values"] for example in examples])
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
     conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
     conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
 
-    prompt_embeds = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples])
-    pooled_prompt_embeds = torch.stack([torch.tensor(example["pooled_prompt_embeds"]) for example in examples])
+    if "prompt_embeds" in examples[0]:
+        prompt_embeds = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples])
+        pooled_prompt_embeds = torch.stack([torch.tensor(example["pooled_prompt_embeds"]) for example in examples])
+    else:
+        if default_prompt_embeds is None or default_pooled_prompt_embeds is None:
+            raise ValueError("Default prompt embeddings must be provided when prompt embeds are missing.")
+        prompt_embeds = default_prompt_embeds.repeat(len(examples), 1, 1)
+        pooled_prompt_embeds = default_pooled_prompt_embeds.repeat(len(examples), 1)
 
     return {
         "pixel_values": pixel_values,
@@ -1341,32 +1343,48 @@ def main(args):
             pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device)
         return {"prompt_embeds": prompt_embeds, "pooled_prompt_embeds": pooled_prompt_embeds}
 
-    compute_embeddings_fn = functools.partial(
-        compute_text_embeddings,
-        text_encoders=text_encoders,
-        tokenizers=tokenizers,
-    )
-    with accelerator.main_process_first():
-        from datasets.fingerprint import Hasher
-
-        # fingerprint used by the cache for the other processes to load the result
-        # details: https://github.com/huggingface/diffusers/pull/4038#discussion_r1266078401
-        new_fingerprint = Hasher.hash(args)
-        train_dataset = train_dataset.map(
-            compute_embeddings_fn,
-            batched=True,keep_in_memory=False,
-            batch_size=args.dataset_preprocess_batch_size,
-            new_fingerprint=new_fingerprint,
+    default_prompt_embeds = None
+    default_pooled_prompt_embeds = None
+    if args.proportion_empty_prompts == 0:
+        with torch.no_grad():
+            prompt_embeds, pooled_prompt_embeds = encode_prompt(
+                text_encoders, tokenizers, args.default_prompt, args.max_sequence_length
+            )
+        default_prompt_embeds = prompt_embeds.cpu()
+        default_pooled_prompt_embeds = pooled_prompt_embeds.cpu()
+    else:
+        compute_embeddings_fn = functools.partial(
+            compute_text_embeddings,
+            text_encoders=text_encoders,
+            tokenizers=tokenizers,
         )
+        with accelerator.main_process_first():
+            from datasets.fingerprint import Hasher
+
+            # fingerprint used by the cache for the other processes to load the result
+            # details: https://github.com/huggingface/diffusers/pull/4038#discussion_r1266078401
+            new_fingerprint = Hasher.hash(args)
+            train_dataset = train_dataset.map(
+                compute_embeddings_fn,
+                batched=True,
+                keep_in_memory=False,
+                batch_size=args.dataset_preprocess_batch_size,
+                new_fingerprint=new_fingerprint,
+            )
 
     del text_encoder_one, text_encoder_two, text_encoder_three
     del tokenizer_one, tokenizer_two, tokenizer_three
     free_memory()
 
+    collate_fn_with_prompt = functools.partial(
+        collate_fn,
+        default_prompt_embeds=default_prompt_embeds,
+        default_pooled_prompt_embeds=default_pooled_prompt_embeds,
+    )
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
-        collate_fn=collate_fn,
+        collate_fn=collate_fn_with_prompt,
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
@@ -1506,8 +1524,23 @@ def main(args):
 
                 # controlnet(s) inference
                 controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
-                controlnet_image = vae.encode(controlnet_image).latent_dist.sample()
-                controlnet_image = (controlnet_image - vae.config.shift_factor) * vae.config.scaling_factor
+                if args.use_inpainting_conditioning:
+                    controlnet_rgb = controlnet_image[:, :3]
+                    controlnet_mask = controlnet_image[:, 3:4]
+                    controlnet_latents = vae.encode(controlnet_rgb).latent_dist.sample()
+                    controlnet_latents = (
+                        controlnet_latents - vae.config.shift_factor
+                    ) * vae.config.scaling_factor
+                    controlnet_mask = F.interpolate(
+                        controlnet_mask,
+                        size=controlnet_latents.shape[-2:],
+                        mode="nearest",
+                    )
+                    controlnet_mask = 1 - controlnet_mask
+                    controlnet_image = torch.cat([controlnet_latents, controlnet_mask], dim=1)
+                else:
+                    controlnet_image = vae.encode(controlnet_image).latent_dist.sample()
+                    controlnet_image = (controlnet_image - vae.config.shift_factor) * vae.config.scaling_factor
 
                 control_block_res_samples = controlnet(
                     hidden_states=noisy_model_input,

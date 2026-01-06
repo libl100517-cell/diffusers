@@ -17,61 +17,10 @@
 import argparse
 from pathlib import Path
 
-import numpy as np
 import torch
-from PIL import Image
 
-from diffusers import SD3ControlNetModel, StableDiffusion3ControlNetPipeline
+from diffusers import SD3ControlNetModel, StableDiffusion3ControlNetInpaintingPipeline
 from diffusers.utils import load_image
-
-
-def generate_low_frequency_noise(height, width):
-    downsample = 8
-    noise_height = max(1, height // downsample)
-    noise_width = max(1, width // downsample)
-    noise = np.random.rand(noise_height, noise_width, 3).astype(np.float32)
-    noise_image = Image.fromarray((noise * 255).astype(np.uint8))
-    noise_image = noise_image.resize((width, height), resample=Image.BILINEAR)
-    return np.array(noise_image).astype(np.float32)
-
-
-def apply_masked_noise(image, mask, mask_threshold):
-    if mask.mode != "L":
-        mask = mask.convert("L")
-    if mask.size != image.size:
-        mask = mask.resize(image.size, resample=Image.NEAREST)
-
-    image_array = np.array(image.convert("RGB")).astype(np.float32)
-    mask_array = np.array(mask) > mask_threshold
-
-    noise_array = generate_low_frequency_noise(*image_array.shape[:2])
-    if mask_array.any():
-        background_pixels = image_array[~mask_array]
-        if background_pixels.size == 0:
-            background_mean = image_array.mean(axis=(0, 1))
-        else:
-            background_mean = background_pixels.reshape(-1, 3).mean(axis=0)
-
-        noise_pixels = noise_array[mask_array]
-        if noise_pixels.size == 0:
-            noise_mean = noise_array.reshape(-1, 3).mean(axis=0)
-        else:
-            noise_mean = noise_pixels.reshape(-1, 3).mean(axis=0)
-
-        noise_array = noise_array - noise_mean + background_mean
-        noise_array = np.clip(noise_array, 0, 255)
-        image_array[mask_array] = noise_array[mask_array]
-
-    return Image.fromarray(image_array.astype(np.uint8))
-
-
-def build_inpainting_conditioning(input_image, mask_image, mask_threshold):
-    masked_image = apply_masked_noise(input_image, mask_image, mask_threshold)
-    mask = mask_image.convert("L").resize(input_image.size, resample=Image.NEAREST)
-    conditioning = np.concatenate(
-        [np.array(masked_image), np.array(mask)[:, :, None]], axis=2
-    )
-    return Image.fromarray(conditioning, mode="RGBA")
 
 
 def parse_args():
@@ -95,33 +44,16 @@ def parse_args():
         help="Prompt to condition the generation.",
     )
     parser.add_argument(
-        "--conditioning_image",
-        type=str,
-        default=None,
-        help="Path to a conditioning image (mask or ControlNet input).",
-    )
-    parser.add_argument(
         "--input_image",
         type=str,
-        default=None,
-        help="Path to the non-crack input image (required with --use_inpainting_conditioning).",
+        required=True,
+        help="Path to the non-crack input image.",
     )
     parser.add_argument(
         "--mask_image",
         type=str,
-        default=None,
-        help="Path to the mask image (required with --use_inpainting_conditioning).",
-    )
-    parser.add_argument(
-        "--use_inpainting_conditioning",
-        action="store_true",
-        help="Build a 4-channel conditioning image from input + mask (matches training).",
-    )
-    parser.add_argument(
-        "--mask_threshold",
-        type=int,
-        default=0,
-        help="Threshold (0-255) for converting masks to binary when applying masked noise.",
+        required=True,
+        help="Path to the mask image.",
     )
     parser.add_argument(
         "--output_path",
@@ -153,29 +85,19 @@ def parse_args():
 def main():
     args = parse_args()
 
-    if args.use_inpainting_conditioning:
-        if args.input_image is None or args.mask_image is None:
-            raise ValueError("--input_image and --mask_image are required with --use_inpainting_conditioning.")
-    elif args.conditioning_image is None:
-        raise ValueError("--conditioning_image is required unless --use_inpainting_conditioning is set.")
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
 
     controlnet = SD3ControlNetModel.from_pretrained(args.controlnet_path, torch_dtype=dtype)
-    pipe = StableDiffusion3ControlNetPipeline.from_pretrained(
+    pipe = StableDiffusion3ControlNetInpaintingPipeline.from_pretrained(
         args.base_model_path,
         controlnet=controlnet,
         torch_dtype=dtype,
     )
     pipe.to(device)
 
-    if args.use_inpainting_conditioning:
-        input_image = load_image(args.input_image)
-        mask_image = load_image(args.mask_image)
-        control_image = build_inpainting_conditioning(input_image, mask_image, args.mask_threshold)
-    else:
-        control_image = load_image(args.conditioning_image)
+    input_image = load_image(args.input_image)
+    mask_image = load_image(args.mask_image)
 
     if args.seed == -1:
         generator = None
@@ -184,7 +106,8 @@ def main():
 
     image = pipe(
         args.prompt,
-        control_image=control_image,
+        control_image=input_image,
+        control_mask=mask_image,
         num_inference_steps=args.num_inference_steps,
         guidance_scale=args.guidance_scale,
         generator=generator,

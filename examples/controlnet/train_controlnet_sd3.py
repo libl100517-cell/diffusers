@@ -31,6 +31,7 @@ from PIL import Image, ImageOps
 import accelerate
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
@@ -926,13 +927,15 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
 
         masks = [load_image(image) for image in examples[conditioning_image_column]]
         if args.use_inpainting_conditioning:
-            masked_images = [apply_masked_noise(image, mask) for image, mask in zip(raw_images, masks)]
-            conditioning_images = [conditioning_image_transforms(image) for image in masked_images]
+            conditioning_images = [image_transforms(image) for image in raw_images]
             mask_tensors = [mask_transforms(mask.convert("L")) for mask in masks]
-            conditioning_pixel_values = [
-                torch.cat([conditioning_image, mask_tensor], dim=0)
-                for conditioning_image, mask_tensor in zip(conditioning_images, mask_tensors)
-            ]
+            threshold = args.mask_threshold / 255.0
+            mask_tensors = [(mask_tensor > threshold).float() for mask_tensor in mask_tensors]
+            conditioning_pixel_values = []
+            for conditioning_image, mask_tensor in zip(conditioning_images, mask_tensors):
+                masked_image = conditioning_image.clone()
+                masked_image[mask_tensor.repeat(3, 1, 1) > 0.5] = -1.0
+                conditioning_pixel_values.append(torch.cat([masked_image, mask_tensor], dim=0))
         else:
             if args.train_data_list is not None:
                 conditioning_images = [apply_masked_noise(image, mask) for image, mask in zip(raw_images, masks)]
@@ -1521,8 +1524,23 @@ def main(args):
 
                 # controlnet(s) inference
                 controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
-                controlnet_image = vae.encode(controlnet_image).latent_dist.sample()
-                controlnet_image = (controlnet_image - vae.config.shift_factor) * vae.config.scaling_factor
+                if args.use_inpainting_conditioning:
+                    controlnet_rgb = controlnet_image[:, :3]
+                    controlnet_mask = controlnet_image[:, 3:4]
+                    controlnet_latents = vae.encode(controlnet_rgb).latent_dist.sample()
+                    controlnet_latents = (
+                        controlnet_latents - vae.config.shift_factor
+                    ) * vae.config.scaling_factor
+                    controlnet_mask = F.interpolate(
+                        controlnet_mask,
+                        size=controlnet_latents.shape[-2:],
+                        mode="nearest",
+                    )
+                    controlnet_mask = 1 - controlnet_mask
+                    controlnet_image = torch.cat([controlnet_latents, controlnet_mask], dim=1)
+                else:
+                    controlnet_image = vae.encode(controlnet_image).latent_dist.sample()
+                    controlnet_image = (controlnet_image - vae.config.shift_factor) * vae.config.scaling_factor
 
                 control_block_res_samples = controlnet(
                     hidden_states=noisy_model_input,

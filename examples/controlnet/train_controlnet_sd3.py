@@ -27,7 +27,7 @@ import shutil
 
 # Add repo root to path to import from tests
 from pathlib import Path
-
+from PIL import Image, ImageOps
 import accelerate
 import numpy as np
 import torch
@@ -883,8 +883,10 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
 
     def load_image(value):
         if isinstance(value, str):
-            normalized_value = value.replace("\\", "/")
-            return Image.open(normalized_value)
+            value = value.replace("\\", "/")
+        with Image.open(value) as img:
+            img = ImageOps.exif_transpose(img)  # 可选：处理 EXIF 旋转
+            return img.copy()  # 关键：copy 后文件句柄就能关闭
         return value
 
     def generate_low_frequency_noise(height, width):
@@ -1352,7 +1354,7 @@ def main(args):
         new_fingerprint = Hasher.hash(args)
         train_dataset = train_dataset.map(
             compute_embeddings_fn,
-            batched=True,
+            batched=True,keep_in_memory=False,
             batch_size=args.dataset_preprocess_batch_size,
             new_fingerprint=new_fingerprint,
         )
